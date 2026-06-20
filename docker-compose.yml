@@ -1,0 +1,14 @@
+services:
+  ldxpm:
+    build: .
+    image: ldxpm:latest
+    container_name: ldxpm
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${PORT:-8765}
+      DB_PATH: /app/data/ldxp_stock_webapp.sqlite3
+    ports:
+      - "${PORT:-8765}:${PORT:-8765}"
+    volumes:
+      - ./data:/app/data
