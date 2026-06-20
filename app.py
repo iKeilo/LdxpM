@@ -805,7 +805,7 @@ def html_page(initial_data):
     .price-flat { color: var(--muted); }
     .priority-btn { height: 30px; border-color: var(--line); background: white; color: var(--muted); }
     .priority-btn.active { border-color: var(--warn); background: #fff7ed; color: var(--warn); }
-    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 180px 180px; gap: 8px; margin-bottom: 10px; }
+    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 180px 180px 180px; gap: 8px; margin-bottom: 10px; }
     .scroll { max-height: 680px; overflow: auto; }
     .shop-item { display: grid; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
     .shop-item:last-child { border-bottom: 0; }
@@ -897,6 +897,11 @@ def html_page(initial_data):
               <option value="all">全部库存</option>
               <option value="zero">只看无货</option>
               <option value="in">只看有货</option>
+            </select>
+            <select id="priceSort">
+              <option value="default">默认排序</option>
+              <option value="asc">价格从低到高</option>
+              <option value="desc">价格从高到低</option>
             </select>
           </div>
           <div class="scroll panel">
@@ -1009,6 +1014,7 @@ def html_page(initial_data):
       const q = $("filterInput").value.trim().toLowerCase();
       const stockFilter = $("stockFilter").value;
       const shopFilter = $("shopFilter").value;
+      const priceSort = $("priceSort").value;
       const rows = data.products.filter(p => {
         const hay = `${p.name} ${p.category} ${p.shop_name} ${p.goods_key}`.toLowerCase();
         if (shopFilter !== "all" && String(p.shop_id) !== shopFilter) return false;
@@ -1017,6 +1023,11 @@ def html_page(initial_data):
         if (stockFilter === "in" && p.stock <= 0) return false;
         return true;
       });
+      if (priceSort === "asc") {
+        rows.sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+      } else if (priceSort === "desc") {
+        rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
+      }
 
       $("products").innerHTML = rows.map(p => `
         <tr>
@@ -1109,6 +1120,7 @@ def html_page(initial_data):
     $("filterInput").oninput = renderProducts;
     $("stockFilter").onchange = renderProducts;
     $("shopFilter").onchange = renderProducts;
+    $("priceSort").onchange = renderProducts;
     $("refreshInterval").onchange = updateRefreshTimer;
 
     $("addShopBtn").onclick = async () => {
