@@ -21,6 +21,8 @@ EMPTY_SHOP_MESSAGE = "店铺当前没有上架商品"
 STOCK_DROP_NOTIFY_SECONDS = 30
 STOCK_DROP_NOTIFY_THRESHOLD = 5
 UNPURCHASEABLE_RECHECK_SECONDS = 600
+DEFAULT_EMAIL_DIGEST_SECONDS = 120
+MIN_EMAIL_DIGEST_SECONDS = 30
 MONITOR_STATUS = {
     "started_at": None,
     "last_heartbeat_at": None,
@@ -136,6 +138,7 @@ def init_db():
                 shop_id integer not null,
                 product_id integer,
                 event_type text not null,
+                email_subject text,
                 message text not null,
                 stock_before integer,
                 stock_after integer,
@@ -171,6 +174,7 @@ def init_db():
         ensure_column(conn, "products", "missing_since", "text")
         ensure_column(conn, "products", "inactive_reason", "text")
         ensure_column(conn, "products", "last_recheck_at", "text")
+        ensure_column(conn, "events", "email_subject", "text")
         conn.execute(
             "update products set last_stock_alert_stock = stock where last_stock_alert_stock is null"
         )
@@ -382,6 +386,25 @@ def notify_email(subject, body):
     return True
 
 
+def email_digest_seconds(conn=None):
+    if conn is not None:
+        value = setting(conn, "email_digest_seconds", str(DEFAULT_EMAIL_DIGEST_SECONDS))
+    else:
+        with closing(db_connect()) as local_conn:
+            value = setting(local_conn, "email_digest_seconds", str(DEFAULT_EMAIL_DIGEST_SECONDS))
+    return max(safe_int(value, DEFAULT_EMAIL_DIGEST_SECONDS), MIN_EMAIL_DIGEST_SECONDS)
+
+
+def last_email_digest_at(conn):
+    value = setting(conn, "last_email_digest_at", "")
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def record_event(
     conn,
     shop_id,
@@ -395,28 +418,117 @@ def record_event(
     cursor = conn.execute(
         """
         insert into events(
-            shop_id, product_id, event_type, message, stock_before, stock_after, created_at
-        ) values(?, ?, ?, ?, ?, ?, ?)
+            shop_id, product_id, event_type, email_subject, message, stock_before, stock_after, created_at
+        ) values(?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (shop_id, product_id, event_type, message, stock_before, stock_after, now_text()),
+        (shop_id, product_id, event_type, subject, message, stock_before, stock_after, now_text()),
     )
-    event_id = cursor.lastrowid
     conn.commit()
 
-    try:
-        sent = notify_email(subject, message)
-        if sent:
-            conn.execute(
-                "update events set emailed_at = ? where id = ?",
-                (now_text(), event_id),
-            )
+    return cursor.lastrowid
+
+
+def event_label_text(event_type):
+    labels = {
+        "restock": "补货",
+        "price_up": "涨价",
+        "price_down": "降价",
+        "stock_drop": "库存减少",
+        "sold_out": "售罄",
+        "unlisted": "未上架",
+        "purchaseable": "恢复",
+    }
+    return labels.get(event_type, "事件")
+
+
+def build_email_digest(events):
+    priority_count = sum(1 for row in events if "【重点通知】" in (row["message"] or ""))
+    shop_count = len({row["shop_id"] for row in events})
+    subject_prefix = "【重点通知】" if priority_count else ""
+    subject = f"{subject_prefix}库存监控摘要：{len(events)} 条提醒，{shop_count} 个店铺"
+    lines = [
+        f"本次合并发送 {len(events)} 条提醒，涉及 {shop_count} 个店铺。",
+        f"生成时间：{now_text()}",
+    ]
+    if priority_count:
+        lines.append(f"其中重点通知 {priority_count} 条。")
+    lines.append("")
+    current_shop = None
+    for index, row in enumerate(events, 1):
+        if row["shop_name"] != current_shop:
+            current_shop = row["shop_name"]
+            lines.append(f"== {current_shop} ==")
+        title = row["email_subject"] or event_label_text(row["event_type"])
+        product_name = row["product_name"] or "商品"
+        lines.append(f"{index}. [{event_label_text(row['event_type'])}] {title} - {product_name}")
+        lines.append(row["message"])
+        link = row["product_link"] or row["shop_link"]
+        if link:
+            lines.append(f"打开：{link}")
+        lines.append("")
+    return subject, "\n".join(lines).strip()
+
+
+def flush_email_digest(force=False):
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            """
+            select
+                e.*,
+                s.name as shop_name,
+                s.link as shop_link,
+                p.name as product_name,
+                case
+                    when p.id is null or coalesce(p.is_active, 1) = 0 then s.link
+                    else p.link
+                end as product_link
+            from events e
+            join shops s on s.id = e.shop_id
+            left join products p on p.id = e.product_id
+            where e.emailed_at is null
+            order by e.id asc
+            limit 100
+            """
+        ).fetchall()
+        if not rows:
+            return {"sent": False, "count": 0}
+        if not force:
+            digest_seconds = email_digest_seconds(conn)
+            last_sent = last_email_digest_at(conn)
+            if last_sent:
+                seconds_since_marker = (datetime.now() - last_sent).total_seconds()
+            else:
+                try:
+                    oldest = datetime.strptime(rows[0]["created_at"], "%Y-%m-%d %H:%M:%S")
+                    seconds_since_marker = (datetime.now() - oldest).total_seconds()
+                except ValueError:
+                    seconds_since_marker = digest_seconds
+            if seconds_since_marker < digest_seconds:
+                return {"sent": False, "count": len(rows)}
+
+        try:
+            subject, body = build_email_digest(rows)
+            sent = notify_email(subject, body)
+            sent_at = now_text()
+            set_setting(conn, "last_email_digest_at", sent_at)
+            if sent:
+                placeholders = ",".join("?" for _ in rows)
+                conn.execute(
+                    f"update events set emailed_at = ? where id in ({placeholders})",
+                    (sent_at, *[row["id"] for row in rows]),
+                )
             conn.commit()
-    except Exception as exc:
-        conn.execute(
-            "update shops set last_error = ? where id = ?",
-            (f"邮件发送失败：{exc}", shop_id),
-        )
-        conn.commit()
+            return {"sent": bool(sent), "count": len(rows)}
+        except Exception as exc:
+            set_setting(conn, "last_email_digest_at", now_text())
+            shop_ids = sorted({row["shop_id"] for row in rows})
+            for shop_id in shop_ids:
+                conn.execute(
+                    "update shops set last_error = ? where id = ?",
+                    (f"邮件摘要发送失败：{exc}", shop_id),
+                )
+            conn.commit()
+            return {"sent": False, "count": len(rows), "error": str(exc)}
 
 
 def record_restock_event(conn, shop_id, product_id, product, previous_stock, current_stock):
@@ -1016,6 +1128,7 @@ def check_enabled_shops(force=False, source="background"):
                     conn.commit()
         flush_stock_drop_alerts(force=False)
         recheck_unpurchaseable_products(force=False)
+        flush_email_digest(force=False)
         finished = get_monitor_status()["checks_finished"] + 1
         payload = {"checks_finished": finished, "last_heartbeat_at": now_text()}
         if checked_any:
@@ -1117,6 +1230,7 @@ def api_summary():
             "smtp_user": setting(conn, "smtp_user", ""),
             "mail_from": setting(conn, "mail_from", ""),
             "mail_to": setting(conn, "mail_to", ""),
+            "email_digest_seconds": str(email_digest_seconds(conn)),
             "smtp_security": smtp_security,
             "smtp_tls": setting(conn, "smtp_tls", "1"),
             "purchase_check_enabled": setting(conn, "purchase_check_enabled", "0"),
@@ -1282,6 +1396,8 @@ def html_page(initial_data):
           <label>SMTP 密码或授权码</label><input id="smtpPassword" type="password" autocomplete="new-password">
           <label>发件人</label><input id="mailFrom">
           <label>收件人</label><input id="mailTo">
+          <label>合并发送间隔，秒</label><input id="emailDigestSeconds" type="number" min="30" value="120">
+          <div class="muted">提醒会先进入队列，再按这个时间窗口跨店铺、跨商品合并成一封邮件。</div>
           <div class="row" style="margin-top: 12px;">
             <button id="saveEmailBtn">保存邮件设置</button>
             <button class="secondary" id="testEmailBtn">测试</button>
@@ -1400,6 +1516,7 @@ def html_page(initial_data):
       $("smtpUser").value = settings.smtp_user || "";
       $("mailFrom").value = settings.mail_from || "";
       $("mailTo").value = settings.mail_to || "";
+      $("emailDigestSeconds").value = settings.email_digest_seconds || "120";
       $("smtpSecurity").value = settings.smtp_security || (settings.smtp_tls === "0" ? "none" : "starttls");
       $("emailEnabled").checked = settings.email_enabled === "1";
       $("purchaseCheckEnabled").checked = settings.purchase_check_enabled === "1";
@@ -1648,6 +1765,7 @@ def html_page(initial_data):
         smtp_password: $("smtpPassword").value,
         mail_from: $("mailFrom").value,
         mail_to: $("mailTo").value,
+        email_digest_seconds: $("emailDigestSeconds").value,
         smtp_security: $("smtpSecurity").value,
         smtp_tls: $("smtpSecurity").value === "none" ? "0" : "1"
       };
@@ -1777,6 +1895,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 "smtp_tls",
             ]:
                 set_setting(conn, key, str(body.get(key, "")))
+            digest_seconds = max(safe_int(body.get("email_digest_seconds"), DEFAULT_EMAIL_DIGEST_SECONDS), MIN_EMAIL_DIGEST_SECONDS)
+            set_setting(conn, "email_digest_seconds", str(digest_seconds))
             set_setting(conn, "smtp_security", security)
             set_setting(conn, "smtp_tls", "0" if security == "none" else "1")
             if body.get("smtp_password"):
