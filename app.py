@@ -1061,7 +1061,7 @@ def html_page(initial_data):
     .price-flat { color: var(--muted); }
     .priority-btn { height: 30px; border-color: var(--line); background: white; color: var(--muted); }
     .priority-btn.active { border-color: var(--warn); background: #fff7ed; color: var(--warn); }
-    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 180px 180px 180px; gap: 8px; margin-bottom: 10px; }
+    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) 160px 150px 150px 120px 120px; gap: 8px; margin-bottom: 10px; }
     .scroll { max-height: 680px; overflow: auto; }
     .shop-item { display: grid; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
     .shop-item:last-child { border-bottom: 0; }
@@ -1157,11 +1157,14 @@ def html_page(initial_data):
               <option value="inactive">只看未上架</option>
             </select>
             <select id="priceSort">
-              <option value="default">默认排序</option>
-              <option value="asc">价格从低到高</option>
-              <option value="desc">价格从高到低</option>
+              <option value="default">筛选后默认排序</option>
+              <option value="asc">筛选后价格低到高</option>
+              <option value="desc">筛选后价格高到低</option>
             </select>
+            <input id="minPriceInput" type="number" min="0" step="0.01" placeholder="最低价">
+            <input id="maxPriceInput" type="number" min="0" step="0.01" placeholder="最高价">
           </div>
+          <div class="muted" id="productResultInfo" style="margin-bottom: 10px;">-</div>
           <div class="row" style="margin-bottom: 10px; align-items: center;">
             <label style="margin:0; flex: 0 0 auto;"><input id="purchaseCheckEnabled" type="checkbox" style="width:auto;height:auto;margin-right:6px;">自动关闭不可购买连接</label>
             <button class="secondary" id="savePurchaseCheckBtn" style="flex:0 0 auto;">保存开关</button>
@@ -1283,15 +1286,20 @@ def html_page(initial_data):
       const stockFilter = $("stockFilter").value;
       const shopFilter = $("shopFilter").value;
       const priceSort = $("priceSort").value;
+      const minPrice = $("minPriceInput").value === "" ? null : Number($("minPriceInput").value);
+      const maxPrice = $("maxPriceInput").value === "" ? null : Number($("maxPriceInput").value);
       const rows = data.products.filter(p => {
         const hay = `${p.name} ${p.category} ${p.shop_name} ${p.goods_key}`.toLowerCase();
         const active = Number(p.is_active ?? 1) === 1;
+        const price = Number(p.price || 0);
         if (shopFilter !== "all" && String(p.shop_id) !== shopFilter) return false;
         if (q && !hay.includes(q)) return false;
         if (stockFilter === "active" && !active) return false;
         if (stockFilter === "inactive" && active) return false;
         if (stockFilter === "zero" && (!active || p.stock > 0)) return false;
         if (stockFilter === "in" && (!active || p.stock <= 0)) return false;
+        if (minPrice !== null && Number.isFinite(minPrice) && price < minPrice) return false;
+        if (maxPrice !== null && Number.isFinite(maxPrice) && price > maxPrice) return false;
         return true;
       });
       if (priceSort === "asc") {
@@ -1299,6 +1307,7 @@ def html_page(initial_data):
       } else if (priceSort === "desc") {
         rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
       }
+      $("productResultInfo").textContent = `当前筛选结果 ${rows.length} 个商品${priceSort === "asc" ? "，已按价格从低到高排序" : priceSort === "desc" ? "，已按价格从高到低排序" : ""}`;
 
       $("products").innerHTML = rows.map(p => {
         const active = Number(p.is_active ?? 1) === 1;
@@ -1397,6 +1406,8 @@ def html_page(initial_data):
     $("stockFilter").onchange = renderProducts;
     $("shopFilter").onchange = renderProducts;
     $("priceSort").onchange = renderProducts;
+    $("minPriceInput").oninput = renderProducts;
+    $("maxPriceInput").oninput = renderProducts;
     $("refreshInterval").onchange = updateRefreshTimer;
 
     $("savePurchaseCheckBtn").onclick = async () => {
