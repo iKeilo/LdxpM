@@ -95,6 +95,8 @@ class FakeShopHandler(BaseHTTPRequestHandler):
                             "price": 12.5,
                             "link": f"{base_url}/item/abc123",
                             "goods_type": "card",
+                            "category": {"id": 1, "name": "默认分类"},
+                            "extend": {"stock_count": 9},
                             "user": {"token": token},
                         },
                     }
@@ -179,12 +181,18 @@ def main():
             assert_equal(result["closed"], 1, "purchase scan should close broken product")
             summary = request_json(f"{base_url}/api/summary")
             assert_equal(summary["products"][0]["is_active"], 0, "broken detail product should be inactive")
-            assert "商品未上架" in summary["events"][0]["message"]
+            assert_equal(summary["events"], [], "closed unpurchaseable product should not create mail event")
 
             STATE["broken_detail"] = False
             request_json(f"{base_url}/api/check", {})
             summary = request_json(f"{base_url}/api/summary")
+            assert_equal(summary["products"][0]["is_active"], 0, "normal shop check should keep closed product hidden")
+            result = request_json(f"{base_url}/api/products/recheck-unpurchaseable", {})
+            assert_equal(result["checked"], 1, "manual recheck should check closed product")
+            assert_equal(result["restored"], 1, "manual recheck should restore purchaseable product")
+            summary = request_json(f"{base_url}/api/summary")
             assert_equal(summary["products"][0]["is_active"], 1, "product should reactivate when detail works")
+            assert_equal(summary["events"][0]["event_type"], "purchaseable", "restore should create purchaseable event")
 
             STATE["empty"] = True
             request_json(f"{base_url}/api/check", {})

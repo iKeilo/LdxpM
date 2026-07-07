@@ -20,6 +20,7 @@ DEFAULT_SHOP_URL = os.environ.get("DEFAULT_SHOP_URL", f"{BASE_URL}/shop/WPXSCE1B
 EMPTY_SHOP_MESSAGE = "店铺当前没有上架商品"
 STOCK_DROP_NOTIFY_SECONDS = 30
 STOCK_DROP_NOTIFY_THRESHOLD = 5
+UNPURCHASEABLE_RECHECK_SECONDS = 600
 MONITOR_STATUS = {
     "started_at": None,
     "last_heartbeat_at": None,
@@ -122,6 +123,8 @@ def init_db():
                 link text not null,
                 is_active integer not null default 1,
                 missing_since text,
+                inactive_reason text,
+                last_recheck_at text,
                 last_seen_at text not null,
                 created_at text not null,
                 unique(shop_id, goods_key),
@@ -166,6 +169,8 @@ def init_db():
         ensure_column(conn, "products", "last_stock_alert_stock", "integer")
         ensure_column(conn, "products", "is_active", "integer not null default 1")
         ensure_column(conn, "products", "missing_since", "text")
+        ensure_column(conn, "products", "inactive_reason", "text")
+        ensure_column(conn, "products", "last_recheck_at", "text")
         conn.execute(
             "update products set last_stock_alert_stock = stock where last_stock_alert_stock is null"
         )
@@ -600,6 +605,27 @@ def record_unlisted_event(conn, shop_id, product_id, product, previous_stock, re
     )
 
 
+def record_purchaseable_event(conn, shop_id, product_id, product):
+    priority_prefix = "【重点通知】" if product.get("priority") else ""
+    message = (
+        f"{priority_prefix}{product['name']} 已恢复可购买，重新回到前台列表\n"
+        f"分类：{product['category']}\n"
+        f"价格：{product['price']}\n"
+        f"库存：{product['stock']}\n"
+        f"链接：{product['link']}"
+    )
+    record_event(
+        conn,
+        shop_id,
+        product_id,
+        "purchaseable",
+        message,
+        None,
+        product["stock"],
+        f"{priority_prefix}商品恢复可购买提醒",
+    )
+
+
 def deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link):
     if seen_keys:
         placeholders = ",".join("?" for _ in seen_keys)
@@ -625,7 +651,8 @@ def deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link)
                 stock = 0,
                 price_delta = 0,
                 is_active = 0,
-                missing_since = coalesce(missing_since, ?)
+                missing_since = coalesce(missing_since, ?),
+                inactive_reason = coalesce(inactive_reason, 'missing')
             where id = ?
             """,
             (checked_at, row["id"]),
@@ -642,7 +669,7 @@ def deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link)
         record_unlisted_event(conn, shop_id, row["id"], product, previous_stock)
 
 
-def deactivate_product(conn, product_id, checked_at, reason):
+def deactivate_product(conn, product_id, checked_at, reason, inactive_reason="unpurchaseable", notify=True):
     row = conn.execute(
         """
         select p.*, s.link as shop_link
@@ -662,10 +689,12 @@ def deactivate_product(conn, product_id, checked_at, reason):
             stock = 0,
             price_delta = 0,
             is_active = 0,
-            missing_since = coalesce(missing_since, ?)
+            missing_since = coalesce(missing_since, ?),
+            inactive_reason = ?,
+            last_recheck_at = case when ? = 'unpurchaseable' then ? else last_recheck_at end
         where id = ?
         """,
-        (checked_at, row["id"]),
+        (checked_at, inactive_reason, inactive_reason, checked_at, row["id"]),
     )
     conn.execute("delete from stock_drop_alerts where product_id = ?", (row["id"],))
     product = {
@@ -676,7 +705,8 @@ def deactivate_product(conn, product_id, checked_at, reason):
         "shop_link": row["shop_link"],
         "priority": row["priority"],
     }
-    record_unlisted_event(conn, row["shop_id"], row["id"], product, previous_stock, reason)
+    if notify:
+        record_unlisted_event(conn, row["shop_id"], row["id"], product, previous_stock, reason)
     return True
 
 
@@ -706,11 +736,105 @@ def close_unpurchaseable_products():
         if ok:
             continue
         with closing(db_connect()) as conn:
-            if deactivate_product(conn, row["id"], checked_at, reason):
+            if deactivate_product(conn, row["id"], checked_at, reason, notify=False):
                 closed += 1
             conn.commit()
 
     return {"checked": checked, "closed": closed, "errors": errors[:20]}
+
+
+def reactivate_product(conn, row, info, checked_at):
+    extend = info.get("extend") or {}
+    category = info.get("category") or {}
+    current_price = float(info.get("price") or row["price"] or 0)
+    previous_price = float(row["price"] or 0)
+    current_stock = safe_int(extend.get("stock_count"), safe_int(row["stock"]))
+    price_delta = round(current_price - previous_price, 2)
+    link = info.get("link") or row["link"]
+    category_name = category.get("name") or row["category"] or ""
+    conn.execute(
+        """
+        update products set
+            name = ?, category = ?, previous_price = ?, price = ?,
+            price_delta = ?, previous_stock = stock, stock = ?,
+            last_stock_alert_stock = ?, link = ?, is_active = 1,
+            missing_since = null, inactive_reason = null,
+            last_recheck_at = ?, last_seen_at = ?
+        where id = ?
+        """,
+        (
+            info.get("name") or row["name"],
+            category_name,
+            previous_price,
+            current_price,
+            price_delta,
+            current_stock,
+            current_stock,
+            link,
+            checked_at,
+            checked_at,
+            row["id"],
+        ),
+    )
+    product = {
+        "name": info.get("name") or row["name"],
+        "category": category_name,
+        "price": current_price,
+        "stock": current_stock,
+        "link": link,
+        "priority": row["priority"],
+    }
+    record_purchaseable_event(conn, row["shop_id"], row["id"], product)
+
+
+def recheck_unpurchaseable_products(force=False):
+    now = datetime.now()
+    checked_at = now_text()
+    checked = 0
+    restored = 0
+    errors = []
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            """
+            select p.*, s.token
+            from products p
+            join shops s on s.id = p.shop_id
+            where p.is_active = 0 and p.inactive_reason = 'unpurchaseable'
+            order by p.last_recheck_at is not null, p.last_recheck_at, p.id
+            """
+        ).fetchall()
+
+    for row in rows:
+        if not force and row["last_recheck_at"]:
+            try:
+                last = datetime.strptime(row["last_recheck_at"], "%Y-%m-%d %H:%M:%S")
+                if (now - last).total_seconds() < UNPURCHASEABLE_RECHECK_SECONDS:
+                    continue
+            except ValueError:
+                pass
+        checked += 1
+        try:
+            info = fetch_goods_info(row["goods_key"], row["token"])
+            if safe_int(info.get("status"), 1) != 1:
+                raise RuntimeError("商品状态不是上架")
+        except Exception as exc:
+            with closing(db_connect()) as conn:
+                conn.execute("update products set last_recheck_at = ? where id = ?", (checked_at, row["id"]))
+                conn.commit()
+            if not is_unpurchaseable_error(exc):
+                errors.append(f"{row['goods_key']}: {exc}")
+            continue
+        with closing(db_connect()) as conn:
+            fresh = conn.execute(
+                "select p.*, s.token from products p join shops s on s.id = p.shop_id where p.id = ?",
+                (row["id"],),
+            ).fetchone()
+            if fresh and fresh["is_active"] == 0 and fresh["inactive_reason"] == "unpurchaseable":
+                reactivate_product(conn, fresh, info, checked_at)
+                restored += 1
+            conn.commit()
+
+    return {"checked": checked, "restored": restored, "errors": errors[:20]}
 
 
 def check_shop(shop_row):
@@ -733,18 +857,23 @@ def check_shop(shop_row):
     seen_keys = set()
     for product in iter_remote_products(token, shop_info):
         seen_keys.add(product["goods_key"])
-        purchaseable = True
-        purchase_reason = None
-        if verify_purchase:
-            try:
-                purchaseable, purchase_reason = product_is_purchaseable(product["goods_key"], token)
-            except Exception as exc:
-                purchase_reason = str(exc)
         with closing(db_connect()) as conn:
             existing = conn.execute(
                 "select * from products where shop_id = ? and goods_key = ?",
                 (shop_id, product["goods_key"]),
             ).fetchone()
+            suppressed_unpurchaseable = (
+                existing
+                and safe_int(existing["is_active"], 1) == 0
+                and existing["inactive_reason"] == "unpurchaseable"
+            )
+            purchaseable = True
+            purchase_reason = None
+            if verify_purchase and not suppressed_unpurchaseable:
+                try:
+                    purchaseable, purchase_reason = product_is_purchaseable(product["goods_key"], token)
+                except Exception as exc:
+                    purchase_reason = str(exc)
             previous_stock = safe_int(existing["stock"]) if existing else 0
             previous_price = float(existing["price"] or 0) if existing else float(product["price"] or 0)
             current_price = float(product["price"] or 0)
@@ -755,13 +884,33 @@ def check_shop(shop_row):
             next_alert_stock = current_stock if (not existing or current_stock > alert_stock) else alert_stock
 
             if existing:
+                if suppressed_unpurchaseable:
+                    conn.execute(
+                        """
+                        update products set
+                            name = ?, category = ?, previous_price = price,
+                            price = ?, price_delta = 0, link = ?, last_seen_at = ?
+                        where id = ?
+                        """,
+                        (
+                            product["name"],
+                            product["category"],
+                            product["price"],
+                            product["link"],
+                            checked_at,
+                            existing["id"],
+                        ),
+                    )
+                    conn.commit()
+                    continue
                 conn.execute(
                     """
                     update products set
                         name = ?, category = ?, previous_price = ?, price = ?,
                         price_delta = ?, previous_stock = ?, stock = ?,
                         last_stock_alert_stock = ?, link = ?, is_active = 1,
-                        missing_since = null, last_seen_at = ?
+                        missing_since = null, inactive_reason = null,
+                        last_recheck_at = null, last_seen_at = ?
                     where id = ?
                     """,
                     (
@@ -785,8 +934,9 @@ def check_shop(shop_row):
                     insert into products(
                         shop_id, goods_key, name, category, price, previous_price,
                         price_delta, stock, previous_stock, last_stock_alert_stock,
-                        link, is_active, missing_since, last_seen_at, created_at
-                    ) values(?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 1, null, ?, ?)
+                        link, is_active, missing_since, inactive_reason,
+                        last_recheck_at, last_seen_at, created_at
+                    ) values(?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 1, null, null, null, ?, ?)
                     """,
                     (
                         shop_id,
@@ -807,7 +957,7 @@ def check_shop(shop_row):
             conn.commit()
             if not purchaseable:
                 with closing(db_connect()) as deactivate_conn:
-                    deactivate_product(deactivate_conn, product_id, checked_at, purchase_reason)
+                    deactivate_product(deactivate_conn, product_id, checked_at, purchase_reason, notify=False)
                     deactivate_conn.commit()
                 continue
             if existing and previous_stock <= 0 < current_stock:
@@ -865,6 +1015,7 @@ def check_enabled_shops(force=False, source="background"):
                     )
                     conn.commit()
         flush_stock_drop_alerts(force=False)
+        recheck_unpurchaseable_products(force=False)
         finished = get_monitor_status()["checks_finished"] + 1
         payload = {"checks_finished": finished, "last_heartbeat_at": now_text()}
         if checked_any:
@@ -969,6 +1120,7 @@ def api_summary():
             "smtp_security": smtp_security,
             "smtp_tls": setting(conn, "smtp_tls", "1"),
             "purchase_check_enabled": setting(conn, "purchase_check_enabled", "0"),
+            "unpurchaseable_recheck_seconds": str(UNPURCHASEABLE_RECHECK_SECONDS),
         }
     return {
         "shops": shops,
@@ -1169,8 +1321,10 @@ def html_page(initial_data):
             <label style="margin:0; flex: 0 0 auto;"><input id="purchaseCheckEnabled" type="checkbox" style="width:auto;height:auto;margin-right:6px;">自动关闭不可购买连接</label>
             <button class="secondary" id="savePurchaseCheckBtn" style="flex:0 0 auto;">保存开关</button>
             <button class="danger" id="closeUnpurchaseableBtn" style="flex:0 0 auto;">一键关闭不可购买连接</button>
+            <button class="secondary" id="recheckUnpurchaseableBtn" style="flex:0 0 auto;">立即复查已关闭连接</button>
             <span class="status" id="purchaseCheckStatus" style="margin:0;"></span>
           </div>
+          <div class="muted" id="purchaseCheckHint" style="margin-bottom: 10px;"></div>
           <div class="scroll panel">
             <table>
               <thead>
@@ -1249,6 +1403,7 @@ def html_page(initial_data):
       $("smtpSecurity").value = settings.smtp_security || (settings.smtp_tls === "0" ? "none" : "starttls");
       $("emailEnabled").checked = settings.email_enabled === "1";
       $("purchaseCheckEnabled").checked = settings.purchase_check_enabled === "1";
+      $("purchaseCheckHint").textContent = `被一键关闭的不可购买连接会在后台约每 ${Math.round(Number(settings.unpurchaseable_recheck_seconds || 600) / 60)} 分钟复查一次；恢复可购买后会重新回到前台并发送恢复邮件。关闭期间不参与邮件提醒。`;
 
       $("shopFilter").innerHTML = `<option value="all">全部店铺</option>` + data.shops.map(shop =>
         `<option value="${shop.id}">${escapeHtml(shop.name)}</option>`
@@ -1354,6 +1509,7 @@ def html_page(initial_data):
       if (type === "stock_drop") return "库存减少";
       if (type === "sold_out") return "售罄";
       if (type === "unlisted") return "未上架";
+      if (type === "purchaseable") return "恢复";
       return "事件";
     }
 
@@ -1436,6 +1592,20 @@ def html_page(initial_data):
         $("purchaseCheckStatus").textContent = err.message;
       } finally {
         $("closeUnpurchaseableBtn").disabled = false;
+      }
+    };
+
+    $("recheckUnpurchaseableBtn").onclick = async () => {
+      $("recheckUnpurchaseableBtn").disabled = true;
+      $("purchaseCheckStatus").textContent = "正在复查...";
+      try {
+        const result = await api("/api/products/recheck-unpurchaseable", { method: "POST", body: JSON.stringify({}) });
+        $("purchaseCheckStatus").textContent = `已复查 ${result.checked} 个，恢复 ${result.restored} 个`;
+        await load();
+      } catch (err) {
+        $("purchaseCheckStatus").textContent = err.message;
+      } finally {
+        $("recheckUnpurchaseableBtn").disabled = false;
       }
     };
 
@@ -1564,6 +1734,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/products/close-unpurchaseable":
                 result = close_unpurchaseable_products()
+                self.send_json({"ok": True, **result})
+                return
+            if parsed.path == "/api/products/recheck-unpurchaseable":
+                result = recheck_unpurchaseable_products(force=True)
                 self.send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/check":
