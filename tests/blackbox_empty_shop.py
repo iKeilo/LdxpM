@@ -12,7 +12,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-STATE = {"empty": False}
+STATE = {"empty": False, "broken_detail": False}
 
 
 def free_port():
@@ -78,6 +78,27 @@ class FakeShopHandler(BaseHTTPRequestHandler):
                     }
                 ]
             self.send_json({"code": 1, "msg": "success", "data": {"total": len(items), "list": items}})
+            return
+
+        if self.path == "/shopApi/Shop/goodsInfo":
+            if STATE["broken_detail"]:
+                self.send_json({"code": 0, "msg": "商品未上架，如有疑问请联系商家", "data": None})
+            else:
+                self.send_json(
+                    {
+                        "code": 1,
+                        "msg": "success",
+                        "data": {
+                            "goods_key": payload.get("goods_key"),
+                            "status": 1,
+                            "name": "黑盒测试商品",
+                            "price": 12.5,
+                            "link": f"{base_url}/item/abc123",
+                            "goods_type": "card",
+                            "user": {"token": token},
+                        },
+                    }
+                )
             return
 
         self.send_json({"code": 0, "msg": "not found"}, 404)
@@ -151,6 +172,19 @@ def main():
             assert_equal(len(summary["products"]), 1, "product should be imported")
             assert_equal(summary["products"][0]["is_active"], 1, "product should start active")
             assert_equal(summary["shops"][0]["active_product_count"], 1, "shop active count")
+
+            STATE["broken_detail"] = True
+            result = request_json(f"{base_url}/api/products/close-unpurchaseable", {})
+            assert_equal(result["checked"], 1, "purchase scan should check active product")
+            assert_equal(result["closed"], 1, "purchase scan should close broken product")
+            summary = request_json(f"{base_url}/api/summary")
+            assert_equal(summary["products"][0]["is_active"], 0, "broken detail product should be inactive")
+            assert "商品未上架" in summary["events"][0]["message"]
+
+            STATE["broken_detail"] = False
+            request_json(f"{base_url}/api/check", {})
+            summary = request_json(f"{base_url}/api/summary")
+            assert_equal(summary["products"][0]["is_active"], 1, "product should reactivate when detail works")
 
             STATE["empty"] = True
             request_json(f"{base_url}/api/check", {})

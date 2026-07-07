@@ -228,6 +228,17 @@ def fetch_goods_page(token, goods_type, category_id, page, page_size):
     )
 
 
+def fetch_goods_info(goods_key, token=None):
+    payload = {"goods_key": goods_key}
+    if token:
+        payload["token"] = token
+    return request_json("/shopApi/Shop/goodsInfo", payload)
+
+
+def is_unlisted_error(exc):
+    return "商品未上架" in str(exc)
+
+
 def shop_list_url(token, category_id=None):
     url = f"{BASE_URL}/shop/{urllib.parse.quote(str(token).strip('/'))}"
     if category_id not in (None, ""):
@@ -249,6 +260,25 @@ def shop_has_listed_goods(shop_info):
         if key.endswith("_count") and key not in {"sell_count"} and safe_int(value) > 0:
             return True
     return safe_int(shop_info.get("goods_count")) > 0
+
+
+def purchase_check_enabled(conn=None):
+    if conn is not None:
+        return setting(conn, "purchase_check_enabled", "0") == "1"
+    with closing(db_connect()) as local_conn:
+        return setting(local_conn, "purchase_check_enabled", "0") == "1"
+
+
+def product_is_purchaseable(goods_key, token=None):
+    try:
+        info = fetch_goods_info(goods_key, token)
+    except RuntimeError as exc:
+        if is_unlisted_error(exc):
+            return False, str(exc)
+        raise
+    if safe_int(info.get("status"), 1) != 1:
+        return False, "商品状态不是上架"
+    return True, None
 
 
 def iter_remote_products(token, shop_info):
@@ -546,7 +576,7 @@ def record_sold_out_event(conn, shop_id, product_id, product, previous_stock):
     )
 
 
-def record_unlisted_event(conn, shop_id, product_id, product, previous_stock):
+def record_unlisted_event(conn, shop_id, product_id, product, previous_stock, reason=None):
     priority_prefix = "【重点通知】" if product.get("priority") else ""
     message = (
         f"{priority_prefix}{product['name']} 已不在店铺上架列表中，"
@@ -555,6 +585,8 @@ def record_unlisted_event(conn, shop_id, product_id, product, previous_stock):
         f"价格：{product['price']}\n"
         f"店铺：{product['shop_link']}"
     )
+    if reason:
+        message += f"\n原因：{reason}"
     record_event(
         conn,
         shop_id,
@@ -609,6 +641,77 @@ def deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link)
         record_unlisted_event(conn, shop_id, row["id"], product, previous_stock)
 
 
+def deactivate_product(conn, product_id, checked_at, reason):
+    row = conn.execute(
+        """
+        select p.*, s.link as shop_link
+        from products p
+        join shops s on s.id = p.shop_id
+        where p.id = ? and p.is_active = 1
+        """,
+        (product_id,),
+    ).fetchone()
+    if not row:
+        return False
+    previous_stock = safe_int(row["stock"])
+    conn.execute(
+        """
+        update products set
+            previous_stock = stock,
+            stock = 0,
+            price_delta = 0,
+            is_active = 0,
+            missing_since = coalesce(missing_since, ?)
+        where id = ?
+        """,
+        (checked_at, row["id"]),
+    )
+    conn.execute("delete from stock_drop_alerts where product_id = ?", (row["id"],))
+    product = {
+        "name": row["name"],
+        "category": row["category"],
+        "price": row["price"],
+        "link": row["link"],
+        "shop_link": row["shop_link"],
+        "priority": row["priority"],
+    }
+    record_unlisted_event(conn, row["shop_id"], row["id"], product, previous_stock, reason)
+    return True
+
+
+def close_unpurchaseable_products():
+    checked_at = now_text()
+    closed = 0
+    checked = 0
+    errors = []
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            """
+            select p.id, p.goods_key, p.name, s.token
+            from products p
+            join shops s on s.id = p.shop_id
+            where p.is_active = 1
+            order by p.id
+            """
+        ).fetchall()
+
+    for row in rows:
+        checked += 1
+        try:
+            ok, reason = product_is_purchaseable(row["goods_key"], row["token"])
+        except Exception as exc:
+            errors.append(f"{row['goods_key']}: {exc}")
+            continue
+        if ok:
+            continue
+        with closing(db_connect()) as conn:
+            if deactivate_product(conn, row["id"], checked_at, reason):
+                closed += 1
+            conn.commit()
+
+    return {"checked": checked, "closed": closed, "errors": errors[:20]}
+
+
 def check_shop(shop_row):
     shop_id = shop_row["id"]
     token = shop_row["token"]
@@ -617,6 +720,7 @@ def check_shop(shop_row):
     shop_name = shop_info.get("nickname") or shop_row["name"]
     shop_link = shop_info.get("link") or shop_row["link"] or shop_list_url(token)
     remote_reports_products = shop_has_listed_goods(shop_info)
+    verify_purchase = purchase_check_enabled()
 
     with closing(db_connect()) as conn:
         conn.execute(
@@ -628,6 +732,13 @@ def check_shop(shop_row):
     seen_keys = set()
     for product in iter_remote_products(token, shop_info):
         seen_keys.add(product["goods_key"])
+        purchaseable = True
+        purchase_reason = None
+        if verify_purchase:
+            try:
+                purchaseable, purchase_reason = product_is_purchaseable(product["goods_key"], token)
+            except Exception as exc:
+                purchase_reason = str(exc)
         with closing(db_connect()) as conn:
             existing = conn.execute(
                 "select * from products where shop_id = ? and goods_key = ?",
@@ -693,6 +804,11 @@ def check_shop(shop_row):
                 product_id = cursor.lastrowid
 
             conn.commit()
+            if not purchaseable:
+                with closing(db_connect()) as deactivate_conn:
+                    deactivate_product(deactivate_conn, product_id, checked_at, purchase_reason)
+                    deactivate_conn.commit()
+                continue
             if existing and previous_stock <= 0 < current_stock:
                 record_restock_event(conn, shop_id, product_id, product, previous_stock, current_stock)
             if existing and previous_stock > 0 and current_stock == 0:
@@ -851,6 +967,7 @@ def api_summary():
             "mail_to": setting(conn, "mail_to", ""),
             "smtp_security": smtp_security,
             "smtp_tls": setting(conn, "smtp_tls", "1"),
+            "purchase_check_enabled": setting(conn, "purchase_check_enabled", "0"),
         }
     return {
         "shops": shops,
@@ -1044,6 +1161,12 @@ def html_page(initial_data):
               <option value="desc">价格从高到低</option>
             </select>
           </div>
+          <div class="row" style="margin-bottom: 10px; align-items: center;">
+            <label style="margin:0; flex: 0 0 auto;"><input id="purchaseCheckEnabled" type="checkbox" style="width:auto;height:auto;margin-right:6px;">自动关闭不可购买连接</label>
+            <button class="secondary" id="savePurchaseCheckBtn" style="flex:0 0 auto;">保存开关</button>
+            <button class="danger" id="closeUnpurchaseableBtn" style="flex:0 0 auto;">一键关闭不可购买连接</button>
+            <span class="status" id="purchaseCheckStatus" style="margin:0;"></span>
+          </div>
           <div class="scroll panel">
             <table>
               <thead>
@@ -1121,6 +1244,7 @@ def html_page(initial_data):
       $("mailTo").value = settings.mail_to || "";
       $("smtpSecurity").value = settings.smtp_security || (settings.smtp_tls === "0" ? "none" : "starttls");
       $("emailEnabled").checked = settings.email_enabled === "1";
+      $("purchaseCheckEnabled").checked = settings.purchase_check_enabled === "1";
 
       $("shopFilter").innerHTML = `<option value="all">全部店铺</option>` + data.shops.map(shop =>
         `<option value="${shop.id}">${escapeHtml(shop.name)}</option>`
@@ -1274,6 +1398,35 @@ def html_page(initial_data):
     $("priceSort").onchange = renderProducts;
     $("refreshInterval").onchange = updateRefreshTimer;
 
+    $("savePurchaseCheckBtn").onclick = async () => {
+      $("purchaseCheckStatus").textContent = "正在保存...";
+      try {
+        await api("/api/settings/purchase-check", {
+          method: "POST",
+          body: JSON.stringify({ enabled: $("purchaseCheckEnabled").checked ? "1" : "0" })
+        });
+        $("purchaseCheckStatus").textContent = "已保存";
+        await load();
+      } catch (err) {
+        $("purchaseCheckStatus").textContent = err.message;
+      }
+    };
+
+    $("closeUnpurchaseableBtn").onclick = async () => {
+      if (!confirm("确定扫描当前所有上架商品，并关闭点进去显示未上架或不可购买的连接吗？")) return;
+      $("closeUnpurchaseableBtn").disabled = true;
+      $("purchaseCheckStatus").textContent = "正在扫描...";
+      try {
+        const result = await api("/api/products/close-unpurchaseable", { method: "POST", body: JSON.stringify({}) });
+        $("purchaseCheckStatus").textContent = `已扫描 ${result.checked} 个，关闭 ${result.closed} 个`;
+        await load();
+      } catch (err) {
+        $("purchaseCheckStatus").textContent = err.message;
+      } finally {
+        $("closeUnpurchaseableBtn").disabled = false;
+      }
+    };
+
     $("addShopBtn").onclick = async () => {
       $("addStatus").textContent = "正在添加...";
       try {
@@ -1397,9 +1550,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     conn.commit()
                 self.send_json({"ok": True, "priority": priority})
                 return
+            if parsed.path == "/api/products/close-unpurchaseable":
+                result = close_unpurchaseable_products()
+                self.send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/check":
                 checked_any = check_enabled_shops(force=True, source="manual")
                 self.send_json({"ok": True, "checked_any": checked_any})
+                return
+            if parsed.path == "/api/settings/purchase-check":
+                with closing(db_connect()) as conn:
+                    enabled = "1" if str(body.get("enabled", "0")) == "1" else "0"
+                    set_setting(conn, "purchase_check_enabled", enabled)
+                    conn.commit()
+                self.send_json({"ok": True, "enabled": enabled})
                 return
             if parsed.path == "/api/settings/email":
                 self.save_email_settings(body)
