@@ -235,8 +235,9 @@ def fetch_goods_info(goods_key, token=None):
     return request_json("/shopApi/Shop/goodsInfo", payload)
 
 
-def is_unlisted_error(exc):
-    return "商品未上架" in str(exc)
+def is_unpurchaseable_error(exc):
+    message = str(exc)
+    return any(text in message for text in ["商品未上架", "商品不存在", "不存在", "已下架", "下架"])
 
 
 def shop_list_url(token, category_id=None):
@@ -273,7 +274,7 @@ def product_is_purchaseable(goods_key, token=None):
     try:
         info = fetch_goods_info(goods_key, token)
     except RuntimeError as exc:
-        if is_unlisted_error(exc):
+        if is_unpurchaseable_error(exc):
             return False, str(exc)
         raise
     if safe_int(info.get("status"), 1) != 1:
