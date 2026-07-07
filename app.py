@@ -13,10 +13,11 @@ from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-BASE_URL = "https://pay.ldxp.cn"
+BASE_URL = os.environ.get("BASE_URL", "https://pay.ldxp.cn").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "ldxp_stock_webapp.sqlite3")
 DEFAULT_INTERVAL_SECONDS = 300
-DEFAULT_SHOP_URL = "https://pay.ldxp.cn/shop/WPXSCE1B/"
+DEFAULT_SHOP_URL = os.environ.get("DEFAULT_SHOP_URL", f"{BASE_URL}/shop/WPXSCE1B/")
+EMPTY_SHOP_MESSAGE = "店铺当前没有上架商品"
 STOCK_DROP_NOTIFY_SECONDS = 30
 STOCK_DROP_NOTIFY_THRESHOLD = 5
 MONITOR_STATUS = {
@@ -34,6 +35,13 @@ CHECK_LOCK = threading.Lock()
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def update_monitor_status(**kwargs):
@@ -112,6 +120,8 @@ def init_db():
                 previous_stock integer not null default 0,
                 last_stock_alert_stock integer,
                 link text not null,
+                is_active integer not null default 1,
+                missing_since text,
                 last_seen_at text not null,
                 created_at text not null,
                 unique(shop_id, goods_key),
@@ -154,6 +164,8 @@ def init_db():
         ensure_column(conn, "products", "price_delta", "real not null default 0")
         ensure_column(conn, "products", "priority", "integer not null default 0")
         ensure_column(conn, "products", "last_stock_alert_stock", "integer")
+        ensure_column(conn, "products", "is_active", "integer not null default 1")
+        ensure_column(conn, "products", "missing_since", "text")
         conn.execute(
             "update products set last_stock_alert_stock = stock where last_stock_alert_stock is null"
         )
@@ -216,10 +228,33 @@ def fetch_goods_page(token, goods_type, category_id, page, page_size):
     )
 
 
+def shop_list_url(token, category_id=None):
+    url = f"{BASE_URL}/shop/{urllib.parse.quote(str(token).strip('/'))}"
+    if category_id not in (None, ""):
+        url = f"{url}/{urllib.parse.quote(str(category_id))}"
+    return url
+
+
+def product_target_link(token, item, category):
+    link = item.get("link") or ""
+    goods_key = item.get("goods_key") or ""
+    category_id = (item.get("category") or category or {}).get("id")
+    if not link and goods_key:
+        return f"{BASE_URL}/item/{urllib.parse.quote(str(goods_key))}"
+    return link or shop_list_url(token, category_id)
+
+
+def shop_has_listed_goods(shop_info):
+    for key, value in shop_info.items():
+        if key.endswith("_count") and key not in {"sell_count"} and safe_int(value) > 0:
+            return True
+    return safe_int(shop_info.get("goods_count")) > 0
+
+
 def iter_remote_products(token, shop_info):
     goods_types = shop_info.get("goods_type_sort") or ["card", "article", "resource", "equity"]
     for goods_type in goods_types:
-        if shop_info.get(f"{goods_type}_count", 0) <= 0:
+        if safe_int(shop_info.get(f"{goods_type}_count", 0)) <= 0:
             continue
         for category in fetch_categories(token, goods_type):
             page = 1
@@ -231,13 +266,15 @@ def iter_remote_products(token, shop_info):
                     extend = item.get("extend") or {}
                     item_category = item.get("category") or category
                     goods_key = item.get("goods_key") or ""
+                    if not goods_key:
+                        continue
                     yield {
                         "goods_key": goods_key,
                         "name": item.get("name") or "",
                         "category": item_category.get("name") or "",
                         "price": item.get("price") or 0,
-                        "stock": int(extend.get("stock_count") or 0),
-                        "link": item.get("link") or f"{BASE_URL}/item/{goods_key}",
+                        "stock": safe_int(extend.get("stock_count")),
+                        "link": product_target_link(token, item, item_category),
                     }
                 if len(items) < page_size:
                     break
@@ -317,7 +354,7 @@ def record_event(
     message,
     stock_before=None,
     stock_after=None,
-    subject="??????",
+    subject="库存提醒",
 ):
     cursor = conn.execute(
         """
@@ -509,36 +546,100 @@ def record_sold_out_event(conn, shop_id, product_id, product, previous_stock):
     )
 
 
+def record_unlisted_event(conn, shop_id, product_id, product, previous_stock):
+    priority_prefix = "【重点通知】" if product.get("priority") else ""
+    message = (
+        f"{priority_prefix}{product['name']} 已不在店铺上架列表中，"
+        f"库存按 0 处理，原库存 {previous_stock}\n"
+        f"分类：{product['category']}\n"
+        f"价格：{product['price']}\n"
+        f"店铺：{product['shop_link']}"
+    )
+    record_event(
+        conn,
+        shop_id,
+        product_id,
+        "unlisted",
+        message,
+        previous_stock,
+        0,
+        f"{priority_prefix}商品未上架提醒",
+    )
+
+
+def deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link):
+    if seen_keys:
+        placeholders = ",".join("?" for _ in seen_keys)
+        rows = conn.execute(
+            f"""
+            select * from products
+            where shop_id = ? and is_active = 1 and goods_key not in ({placeholders})
+            """,
+            (shop_id, *seen_keys),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "select * from products where shop_id = ? and is_active = 1",
+            (shop_id,),
+        ).fetchall()
+
+    for row in rows:
+        previous_stock = safe_int(row["stock"])
+        conn.execute(
+            """
+            update products set
+                previous_stock = stock,
+                stock = 0,
+                price_delta = 0,
+                is_active = 0,
+                missing_since = coalesce(missing_since, ?)
+            where id = ?
+            """,
+            (checked_at, row["id"]),
+        )
+        conn.execute("delete from stock_drop_alerts where product_id = ?", (row["id"],))
+        product = {
+            "name": row["name"],
+            "category": row["category"],
+            "price": row["price"],
+            "link": row["link"],
+            "shop_link": shop_link,
+            "priority": row["priority"],
+        }
+        record_unlisted_event(conn, shop_id, row["id"], product, previous_stock)
+
+
 def check_shop(shop_row):
     shop_id = shop_row["id"]
     token = shop_row["token"]
     checked_at = now_text()
     shop_info = fetch_shop_info(token)
+    shop_name = shop_info.get("nickname") or shop_row["name"]
+    shop_link = shop_info.get("link") or shop_row["link"] or shop_list_url(token)
+    remote_reports_products = shop_has_listed_goods(shop_info)
 
     with closing(db_connect()) as conn:
         conn.execute(
-            "update shops set name = ?, link = ?, last_error = null where id = ?",
-            (
-                shop_info.get("nickname") or shop_row["name"],
-                shop_info.get("link") or shop_row["link"],
-                shop_id,
-            ),
+            "update shops set name = ?, link = ? where id = ?",
+            (shop_name, shop_link, shop_id),
         )
         conn.commit()
 
+    seen_keys = set()
     for product in iter_remote_products(token, shop_info):
+        seen_keys.add(product["goods_key"])
         with closing(db_connect()) as conn:
             existing = conn.execute(
                 "select * from products where shop_id = ? and goods_key = ?",
                 (shop_id, product["goods_key"]),
             ).fetchone()
-            previous_stock = int(existing["stock"]) if existing else 0
+            previous_stock = safe_int(existing["stock"]) if existing else 0
             previous_price = float(existing["price"] or 0) if existing else float(product["price"] or 0)
             current_price = float(product["price"] or 0)
             price_delta = round(current_price - previous_price, 2) if existing else 0
             product["priority"] = int(existing["priority"]) if existing else 0
-            current_stock = int(product["stock"] or 0)
-            alert_stock = int(existing["last_stock_alert_stock"]) if existing and existing["last_stock_alert_stock"] is not None else previous_stock
+            current_stock = safe_int(product["stock"])
+            alert_stock = safe_int(existing["last_stock_alert_stock"]) if existing and existing["last_stock_alert_stock"] is not None else previous_stock
             next_alert_stock = current_stock if (not existing or current_stock > alert_stock) else alert_stock
 
             if existing:
@@ -547,7 +648,8 @@ def check_shop(shop_row):
                     update products set
                         name = ?, category = ?, previous_price = ?, price = ?,
                         price_delta = ?, previous_stock = ?, stock = ?,
-                        last_stock_alert_stock = ?, link = ?, last_seen_at = ?
+                        last_stock_alert_stock = ?, link = ?, is_active = 1,
+                        missing_since = null, last_seen_at = ?
                     where id = ?
                     """,
                     (
@@ -571,8 +673,8 @@ def check_shop(shop_row):
                     insert into products(
                         shop_id, goods_key, name, category, price, previous_price,
                         price_delta, stock, previous_stock, last_stock_alert_stock,
-                        link, last_seen_at, created_at
-                    ) values(?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?)
+                        link, is_active, missing_since, last_seen_at, created_at
+                    ) values(?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 1, null, ?, ?)
                     """,
                     (
                         shop_id,
@@ -606,9 +708,14 @@ def check_shop(shop_row):
                 record_price_event(conn, shop_id, product_id, product, previous_price, current_price)
 
     with closing(db_connect()) as conn:
+        if seen_keys or not remote_reports_products:
+            deactivate_missing_products(conn, shop_id, seen_keys, checked_at, shop_link)
+            last_error = None if seen_keys else EMPTY_SHOP_MESSAGE
+        else:
+            last_error = "远端显示有商品，但本次列表为空，已跳过下架判定"
         conn.execute(
-            "update shops set last_checked_at = ?, last_error = null where id = ?",
-            (checked_at, shop_id),
+            "update shops set last_checked_at = ?, last_error = ? where id = ?",
+            (checked_at, last_error, shop_id),
         )
         conn.commit()
 
@@ -673,15 +780,34 @@ def row_to_dict(row):
 
 def api_summary():
     with closing(db_connect()) as conn:
-        shops = [row_to_dict(row) for row in conn.execute("select * from shops order by id desc")]
+        shops = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                select
+                    s.*,
+                    coalesce(sum(case when coalesce(p.is_active, 1) = 1 then 1 else 0 end), 0) as active_product_count,
+                    coalesce(sum(case when coalesce(p.is_active, 1) = 0 then 1 else 0 end), 0) as inactive_product_count,
+                    count(p.id) as product_count
+                from shops s
+                left join products p on p.shop_id = s.id
+                group by s.id
+                order by s.id desc
+                """
+            )
+        ]
         products = [
             row_to_dict(row)
             for row in conn.execute(
                 """
-                select p.*, s.name as shop_name, s.token as shop_token
+                select
+                    p.*,
+                    s.name as shop_name,
+                    s.token as shop_token,
+                    s.link as shop_link
                 from products p
                 join shops s on s.id = p.shop_id
-                order by p.stock asc, p.last_seen_at desc
+                order by p.is_active desc, p.stock asc, p.last_seen_at desc
                 """
             )
         ]
@@ -689,7 +815,16 @@ def api_summary():
             row_to_dict(row)
             for row in conn.execute(
                 """
-                select e.*, s.name as shop_name, p.name as product_name, p.link as product_link
+                select
+                    e.*,
+                    s.name as shop_name,
+                    s.link as shop_link,
+                    p.name as product_name,
+                    case
+                        when p.id is null or coalesce(p.is_active, 1) = 0 then s.link
+                        else p.link
+                    end as product_link,
+                    coalesce(p.is_active, 0) as product_is_active
                 from events e
                 join shops s on s.id = e.shop_id
                 left join products p on p.id = e.product_id
@@ -800,6 +935,9 @@ def html_page(initial_data):
     .badge { display: inline-flex; align-items: center; min-width: 46px; justify-content: center; height: 24px; padding: 0 8px; border-radius: 999px; font-weight: 700; }
     .badge.zero { color: var(--bad); background: #fee2e2; }
     .badge.good { color: var(--good); background: #d1fae5; }
+    .badge.inactive { color: var(--muted); background: #e5e7eb; }
+    tr.inactive { background: #fafafa; }
+    tr.inactive td { color: var(--muted); }
     .price-up { color: var(--bad); font-weight: 700; }
     .price-down { color: var(--good); font-weight: 700; }
     .price-flat { color: var(--muted); }
@@ -845,7 +983,7 @@ def html_page(initial_data):
       <div class="stat"><span class="muted">商品</span><strong id="productCount">0</strong></div>
       <div class="stat"><span class="muted">有货</span><strong id="inStockCount">0</strong></div>
       <div class="stat"><span class="muted">价格变化</span><strong id="priceChangeCount">0</strong></div>
-      <div class="stat"><span class="muted">事件</span><strong id="eventCount">0</strong></div>
+      <div class="stat"><span class="muted">未上架</span><strong id="inactiveCount">0</strong></div>
       <div class="stat"><span class="muted">后台心跳</span><strong id="monitorHeartbeat" style="font-size:13px;">-</strong></div>
     </div>
 
@@ -894,9 +1032,11 @@ def html_page(initial_data):
             <input id="filterInput" placeholder="搜索商品、分类、店铺">
             <select id="shopFilter"><option value="all">全部店铺</option></select>
             <select id="stockFilter">
-              <option value="all">全部库存</option>
+              <option value="active" selected>当前上架</option>
+              <option value="all">全部商品</option>
               <option value="zero">只看无货</option>
               <option value="in">只看有货</option>
+              <option value="inactive">只看未上架</option>
             </select>
             <select id="priceSort">
               <option value="default">默认排序</option>
@@ -908,7 +1048,7 @@ def html_page(initial_data):
             <table>
               <thead>
                 <tr>
-                  <th>商品</th><th>店铺</th><th>分类</th><th>价格</th><th>价格变化</th><th>库存</th><th>监控级别</th><th>更新时间</th>
+                  <th>商品</th><th>店铺</th><th>分类</th><th>价格</th><th>价格变化</th><th>库存</th><th>状态</th><th>监控级别</th><th>更新时间</th>
                 </tr>
               </thead>
               <tbody id="products"></tbody>
@@ -964,11 +1104,13 @@ def html_page(initial_data):
 
     function render() {
       const selectedShop = $("shopFilter").value || "all";
+      const activeProducts = data.products.filter(p => Number(p.is_active ?? 1) === 1);
+      const inactiveProducts = data.products.filter(p => Number(p.is_active ?? 1) === 0);
       $("shopCount").textContent = data.shops.length;
-      $("productCount").textContent = data.products.length;
-      $("inStockCount").textContent = data.products.filter(p => p.stock > 0).length;
-      $("priceChangeCount").textContent = data.products.filter(p => Number(p.price_delta || 0) !== 0).length;
-      $("eventCount").textContent = data.events.length;
+      $("productCount").textContent = activeProducts.length;
+      $("inStockCount").textContent = activeProducts.filter(p => p.stock > 0).length;
+      $("priceChangeCount").textContent = activeProducts.filter(p => Number(p.price_delta || 0) !== 0).length;
+      $("inactiveCount").textContent = inactiveProducts.length;
       $("monitorHeartbeat").textContent = data.monitor?.last_heartbeat_at || "未启动";
 
       const settings = data.settings || {};
@@ -989,6 +1131,7 @@ def html_page(initial_data):
         <div class="shop-item">
           <strong><a href="${escapeAttr(shop.link)}" target="_blank" rel="noreferrer">${escapeHtml(shop.name)}</a></strong>
           <span class="muted">${escapeHtml(shop.token)} · ${shop.enabled ? "监控中" : "已停用"} · ${shop.interval_seconds}s</span>
+          <span class="muted">上架 ${shop.active_product_count || 0} · 未上架 ${shop.inactive_product_count || 0}</span>
           <span class="muted">上次检查：${escapeHtml(shop.last_checked_at || "尚未检查")}</span>
           ${shop.last_error ? `<span class="error">${escapeHtml(shop.last_error)}</span>` : ""}
           <div class="shop-actions">
@@ -1017,10 +1160,13 @@ def html_page(initial_data):
       const priceSort = $("priceSort").value;
       const rows = data.products.filter(p => {
         const hay = `${p.name} ${p.category} ${p.shop_name} ${p.goods_key}`.toLowerCase();
+        const active = Number(p.is_active ?? 1) === 1;
         if (shopFilter !== "all" && String(p.shop_id) !== shopFilter) return false;
         if (q && !hay.includes(q)) return false;
-        if (stockFilter === "zero" && p.stock > 0) return false;
-        if (stockFilter === "in" && p.stock <= 0) return false;
+        if (stockFilter === "active" && !active) return false;
+        if (stockFilter === "inactive" && active) return false;
+        if (stockFilter === "zero" && (!active || p.stock > 0)) return false;
+        if (stockFilter === "in" && (!active || p.stock <= 0)) return false;
         return true;
       });
       if (priceSort === "asc") {
@@ -1029,18 +1175,22 @@ def html_page(initial_data):
         rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
       }
 
-      $("products").innerHTML = rows.map(p => `
-        <tr>
-          <td><a href="${escapeAttr(p.link)}" target="_blank" rel="noreferrer">${escapeHtml(p.name)}</a><br><span class="muted">${escapeHtml(p.goods_key)}</span></td>
+      $("products").innerHTML = rows.map(p => {
+        const active = Number(p.is_active ?? 1) === 1;
+        const targetLink = active ? p.link : p.shop_link;
+        return `
+        <tr class="${active ? "" : "inactive"}">
+          <td><a href="${escapeAttr(targetLink)}" target="_blank" rel="noreferrer">${escapeHtml(p.name)}</a><br><span class="muted">${escapeHtml(p.goods_key)}</span></td>
           <td>${escapeHtml(p.shop_name)}</td>
           <td>${escapeHtml(p.category || "")}</td>
           <td>${Number(p.price || 0).toFixed(2)}</td>
           <td>${formatPriceDelta(p)}</td>
-          <td><span class="badge ${p.stock > 0 ? "good" : "zero"}">${p.stock}</span></td>
+          <td><span class="badge ${active ? (p.stock > 0 ? "good" : "zero") : "inactive"}">${active ? p.stock : "未上架"}</span></td>
+          <td>${active ? "上架" : `未上架${p.missing_since ? " · " + escapeHtml(p.missing_since) : ""}`}</td>
           <td><button class="priority-btn ${p.priority ? "active" : ""}" data-priority-product="${p.id}" data-priority-value="${p.priority ? 0 : 1}">${p.priority ? "重点监控" : "非重点"}</button></td>
           <td>${escapeHtml(p.last_seen_at || "")}</td>
         </tr>
-      `).join("") || `<tr><td colspan="8" class="muted">没有匹配商品</td></tr>`;
+      `}).join("") || `<tr><td colspan="9" class="muted">没有匹配商品</td></tr>`;
       document.querySelectorAll("[data-priority-product]").forEach(btn => {
         btn.onclick = () => togglePriority(btn.getAttribute("data-priority-product"), btn.getAttribute("data-priority-value"));
       });
@@ -1069,6 +1219,7 @@ def html_page(initial_data):
       if (type === "price_down") return "降价";
       if (type === "stock_drop") return "库存减少";
       if (type === "sold_out") return "售罄";
+      if (type === "unlisted") return "未上架";
       return "事件";
     }
 
@@ -1284,6 +1435,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def bootstrap_default_shop():
+    if not DEFAULT_SHOP_URL:
+        return
     with closing(db_connect()) as conn:
         count = conn.execute("select count(*) as count from shops").fetchone()["count"]
     if count == 0:

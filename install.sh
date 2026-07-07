@@ -5,6 +5,7 @@ REPO_URL="https://github.com/iKeilo/LdxpM.git"
 INSTALL_DIR="${INSTALL_DIR:-/opt/ldxpm}"
 SERVICE_NAME="ldxpm"
 DEFAULT_PORT="8765"
+DEFAULT_IMAGE_TAG="latest"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -58,6 +59,7 @@ write_env() {
   local port="$1"
   cat > "${INSTALL_DIR}/.env" <<EOF
 PORT=${port}
+IMAGE_TAG=${IMAGE_TAG:-${DEFAULT_IMAGE_TAG}}
 EOF
 }
 
@@ -90,7 +92,8 @@ install_app() {
   mkdir -p "${INSTALL_DIR}/data"
   write_env "${port}"
   cd "${INSTALL_DIR}"
-  $(compose_cmd) up -d --build
+  $(compose_cmd) pull
+  $(compose_cmd) up -d
   show_url
 }
 
@@ -103,7 +106,8 @@ update_app() {
   cd "${INSTALL_DIR}"
   echo -e "${YELLOW}正在从 GitHub 拉取最新版本...${NC}"
   git pull --ff-only
-  $(compose_cmd) up -d --build
+  $(compose_cmd) pull
+  $(compose_cmd) up -d
   show_url
 }
 

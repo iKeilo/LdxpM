@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: ldxpm-linux-amd64
+          - os: ubuntu-24.04-arm
+            artifact: ldxpm-linux-arm64
+          - os: macos-15-intel
+            artifact: ldxpm-macos-amd64
+          - os: macos-15
+            artifact: ldxpm-macos-arm64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --name ldxpm app.py
+
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp README.md package/
+          cp install.sh package/
+          if [ -f dist/ldxpm ]; then
+            cp dist/ldxpm package/ldxpm
+            chmod +x package/ldxpm
+          elif [ -f dist/ldxpm.exe ]; then
+            cp dist/ldxpm.exe package/ldxpm.exe
+          else
+            echo "Built executable not found" >&2
+            exit 1
+          fi
+
+      - name: Create archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C package .
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.value }}
+          name: LdxpM ${{ steps.version.outputs.value }}
+          generate_release_notes: true
+          files: artifacts/**/*.tar.gz

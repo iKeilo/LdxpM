@@ -1,7 +1,6 @@
 services:
   ldxpm:
-    build: .
-    image: ldxpm:latest
+    image: ghcr.io/ikeilo/ldxpm:${IMAGE_TAG:-latest}
     container_name: ldxpm
     restart: unless-stopped
     environment:
