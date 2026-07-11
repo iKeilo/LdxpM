@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import json
+import hmac
 import os
 import re
+import secrets
 import smtplib
 import sqlite3
 import threading
+import time
 import urllib.parse
 import urllib.request
 from contextlib import closing
 from datetime import datetime
 from email.message import EmailMessage
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -23,6 +27,10 @@ STOCK_DROP_NOTIFY_THRESHOLD = 5
 UNPURCHASEABLE_RECHECK_SECONDS = 600
 DEFAULT_EMAIL_DIGEST_SECONDS = 120
 MIN_EMAIL_DIGEST_SECONDS = 30
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+SESSION_COOKIE = "ldxpm_admin_session"
+SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 MONITOR_STATUS = {
     "started_at": None,
     "last_heartbeat_at": None,
@@ -34,6 +42,8 @@ MONITOR_STATUS = {
 }
 MONITOR_STATUS_LOCK = threading.Lock()
 CHECK_LOCK = threading.Lock()
+SESSION_LOCK = threading.Lock()
+SESSIONS = {}
 
 
 def now_text():
@@ -55,6 +65,69 @@ def update_monitor_status(**kwargs):
 def get_monitor_status():
     with MONITOR_STATUS_LOCK:
         return dict(MONITOR_STATUS)
+
+
+def check_admin_credentials(username, password):
+    return hmac.compare_digest(str(username or ""), ADMIN_USERNAME) and hmac.compare_digest(
+        str(password or ""),
+        ADMIN_PASSWORD,
+    )
+
+
+def create_session(username):
+    token = secrets.token_urlsafe(32)
+    expires_at = time.time() + SESSION_TTL_SECONDS
+    with SESSION_LOCK:
+        SESSIONS[token] = {"username": username, "expires_at": expires_at}
+    return token
+
+
+def parse_cookie(header):
+    cookie = SimpleCookie()
+    if header:
+        try:
+            cookie.load(header)
+        except Exception:
+            return {}
+    return {key: morsel.value for key, morsel in cookie.items()}
+
+
+def get_session(cookie_header):
+    token = parse_cookie(cookie_header).get(SESSION_COOKIE)
+    if not token:
+        return None
+    now = time.time()
+    with SESSION_LOCK:
+        session = SESSIONS.get(token)
+        if not session:
+            return None
+        if session["expires_at"] <= now:
+            SESSIONS.pop(token, None)
+            return None
+        return dict(session)
+
+
+def destroy_session(cookie_header):
+    token = parse_cookie(cookie_header).get(SESSION_COOKIE)
+    if not token:
+        return
+    with SESSION_LOCK:
+        SESSIONS.pop(token, None)
+
+
+def auth_payload(session):
+    return {"is_admin": bool(session), "username": session["username"] if session else ""}
+
+
+def auth_cookie(token):
+    return (
+        f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
+        f"Max-Age={SESSION_TTL_SECONDS}"
+    )
+
+
+def expired_auth_cookie():
+    return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
 
 
 def extract_token(value):
@@ -1159,7 +1232,8 @@ def row_to_dict(row):
     return dict(row) if row else None
 
 
-def api_summary():
+def api_summary(session=None):
+    is_admin = bool(session)
     with closing(db_connect()) as conn:
         shops = [
             row_to_dict(row)
@@ -1224,24 +1298,30 @@ def api_summary():
             ),
         )
         settings = {
-            "email_enabled": setting(conn, "email_enabled", "0"),
-            "smtp_host": setting(conn, "smtp_host", ""),
-            "smtp_port": smtp_port,
-            "smtp_user": setting(conn, "smtp_user", ""),
-            "mail_from": setting(conn, "mail_from", ""),
-            "mail_to": setting(conn, "mail_to", ""),
-            "email_digest_seconds": str(email_digest_seconds(conn)),
-            "smtp_security": smtp_security,
-            "smtp_tls": setting(conn, "smtp_tls", "1"),
             "purchase_check_enabled": setting(conn, "purchase_check_enabled", "0"),
             "unpurchaseable_recheck_seconds": str(UNPURCHASEABLE_RECHECK_SECONDS),
         }
+        if is_admin:
+            settings.update(
+                {
+                    "email_enabled": setting(conn, "email_enabled", "0"),
+                    "smtp_host": setting(conn, "smtp_host", ""),
+                    "smtp_port": smtp_port,
+                    "smtp_user": setting(conn, "smtp_user", ""),
+                    "mail_from": setting(conn, "mail_from", ""),
+                    "mail_to": setting(conn, "mail_to", ""),
+                    "email_digest_seconds": str(email_digest_seconds(conn)),
+                    "smtp_security": smtp_security,
+                    "smtp_tls": setting(conn, "smtp_tls", "1"),
+                }
+            )
     return {
         "shops": shops,
         "products": products,
         "events": events,
         "settings": settings,
         "monitor": get_monitor_status(),
+        "auth": auth_payload(session),
     }
 
 
@@ -1332,6 +1412,7 @@ def html_page(initial_data):
     .shop-item { display: grid; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
     .shop-item:last-child { border-bottom: 0; }
     .shop-actions { display: flex; gap: 8px; }
+    .auth-actions { display: flex; gap: 8px; align-items: center; }
     .error { color: var(--bad); }
     .event { padding: 12px; border-bottom: 1px solid var(--line); white-space: pre-line; }
     .event:last-child { border-bottom: 0; }
@@ -1357,7 +1438,7 @@ def html_page(initial_data):
         <option value="60000">每 1 分钟刷新</option>
       </select>
       <button class="secondary" id="refreshBtn">刷新</button>
-      <button id="checkBtn">立即检查</button>
+      <button class="admin-only" id="checkBtn">立即检查</button>
     </div>
   </header>
 
@@ -1373,7 +1454,25 @@ def html_page(initial_data):
 
     <div class="grid">
       <aside>
-        <section>
+        <section id="loginPanel">
+          <h2>管理员登录</h2>
+          <label>用户名</label>
+          <input id="loginUser" value="admin" autocomplete="username">
+          <label>密码</label>
+          <input id="loginPassword" type="password" autocomplete="current-password">
+          <div class="row" style="margin-top: 12px;"><button id="loginBtn">登录</button></div>
+          <div class="status" id="loginStatus"></div>
+        </section>
+
+        <section id="adminSessionPanel" style="display:none;">
+          <h2>管理员</h2>
+          <div class="auth-actions">
+            <span class="muted" id="adminName">未登录</span>
+            <button class="secondary" id="logoutBtn">退出登录</button>
+          </div>
+        </section>
+
+        <section class="admin-only">
           <h2>添加店铺</h2>
           <label>店铺链接或 token</label>
           <input id="shopInput" placeholder="https://pay.ldxp.cn/shop/WPXSCE1B/">
@@ -1383,7 +1482,7 @@ def html_page(initial_data):
           <div class="status" id="addStatus"></div>
         </section>
 
-        <section>
+        <section class="admin-only">
           <h2>邮件通知</h2>
           <label><input id="emailEnabled" type="checkbox" style="width:auto;height:auto;margin-right:6px;">开启邮件通知</label>
           <label>SMTP 服务器</label>
@@ -1433,7 +1532,7 @@ def html_page(initial_data):
             <input id="maxPriceInput" type="number" min="0" step="0.01" placeholder="最高价">
           </div>
           <div class="muted" id="productResultInfo" style="margin-bottom: 10px;">-</div>
-          <div class="row" style="margin-bottom: 10px; align-items: center;">
+          <div class="row admin-only" style="margin-bottom: 10px; align-items: center;">
             <label style="margin:0; flex: 0 0 auto;"><input id="purchaseCheckEnabled" type="checkbox" style="width:auto;height:auto;margin-right:6px;">自动关闭不可购买连接</label>
             <button class="secondary" id="savePurchaseCheckBtn" style="flex:0 0 auto;">保存开关</button>
             <button class="danger" id="closeUnpurchaseableBtn" style="flex:0 0 auto;">一键关闭不可购买连接</button>
@@ -1465,6 +1564,7 @@ def html_page(initial_data):
     let data = __INITIAL_DATA__;
     let refreshTimer = null;
     const $ = (id) => document.getElementById(id);
+    const isAdmin = () => Boolean(data.auth && data.auth.is_admin);
 
     async function api(path, options = {}) {
       return new Promise((resolve, reject) => {
@@ -1500,6 +1600,7 @@ def html_page(initial_data):
     }
 
     function render() {
+      const admin = isAdmin();
       const selectedShop = $("shopFilter").value || "all";
       const activeProducts = data.products.filter(p => Number(p.is_active ?? 1) === 1);
       const inactiveProducts = data.products.filter(p => Number(p.is_active ?? 1) === 0);
@@ -1509,6 +1610,12 @@ def html_page(initial_data):
       $("priceChangeCount").textContent = activeProducts.filter(p => Number(p.price_delta || 0) !== 0).length;
       $("inactiveCount").textContent = inactiveProducts.length;
       $("monitorHeartbeat").textContent = data.monitor?.last_heartbeat_at || "未启动";
+      $("loginPanel").style.display = admin ? "none" : "";
+      $("adminSessionPanel").style.display = admin ? "" : "none";
+      $("adminName").textContent = admin ? `已登录：${data.auth.username}` : "未登录";
+      document.querySelectorAll(".admin-only").forEach(el => {
+        el.style.display = admin ? "" : "none";
+      });
 
       const settings = data.settings || {};
       $("smtpHost").value = settings.smtp_host || "";
@@ -1534,26 +1641,29 @@ def html_page(initial_data):
           <span class="muted">上架 ${shop.active_product_count || 0} · 未上架 ${shop.inactive_product_count || 0}</span>
           <span class="muted">上次检查：${escapeHtml(shop.last_checked_at || "尚未检查")}</span>
           ${shop.last_error ? `<span class="error">${escapeHtml(shop.last_error)}</span>` : ""}
-          <div class="shop-actions">
+          ${admin ? `<div class="shop-actions">
             <input data-shop-interval="${shop.id}" type="number" min="60" value="${shop.interval_seconds}" title="后端检查间隔，秒">
             <button class="secondary" data-save-shop-interval="${shop.id}">保存间隔</button>
             <button class="danger" data-delete-shop="${shop.id}">删除店铺</button>
-          </div>
+          </div>` : ""}
         </div>
       `).join("") || `<div class="muted">还没有店铺</div>`;
 
-      document.querySelectorAll("[data-delete-shop]").forEach(btn => {
-        btn.onclick = () => deleteShop(btn.getAttribute("data-delete-shop"));
-      });
-      document.querySelectorAll("[data-save-shop-interval]").forEach(btn => {
-        btn.onclick = () => saveShopInterval(btn.getAttribute("data-save-shop-interval"));
-      });
+      if (admin) {
+        document.querySelectorAll("[data-delete-shop]").forEach(btn => {
+          btn.onclick = () => deleteShop(btn.getAttribute("data-delete-shop"));
+        });
+        document.querySelectorAll("[data-save-shop-interval]").forEach(btn => {
+          btn.onclick = () => saveShopInterval(btn.getAttribute("data-save-shop-interval"));
+        });
+      }
 
       renderProducts();
       renderEvents();
     }
 
     function renderProducts() {
+      const admin = isAdmin();
       const q = $("filterInput").value.trim().toLowerCase();
       const stockFilter = $("stockFilter").value;
       const shopFilter = $("shopFilter").value;
@@ -1593,13 +1703,15 @@ def html_page(initial_data):
           <td>${formatPriceDelta(p)}</td>
           <td><span class="badge ${active ? (p.stock > 0 ? "good" : "zero") : "inactive"}">${active ? p.stock : "未上架"}</span></td>
           <td>${active ? "上架" : `未上架${p.missing_since ? " · " + escapeHtml(p.missing_since) : ""}`}</td>
-          <td><button class="priority-btn ${p.priority ? "active" : ""}" data-priority-product="${p.id}" data-priority-value="${p.priority ? 0 : 1}">${p.priority ? "重点监控" : "非重点"}</button></td>
+          <td>${admin ? `<button class="priority-btn ${p.priority ? "active" : ""}" data-priority-product="${p.id}" data-priority-value="${p.priority ? 0 : 1}">${p.priority ? "重点监控" : "非重点"}</button>` : (p.priority ? "重点监控" : "非重点")}</td>
           <td>${escapeHtml(p.last_seen_at || "")}</td>
         </tr>
       `}).join("") || `<tr><td colspan="9" class="muted">没有匹配商品</td></tr>`;
-      document.querySelectorAll("[data-priority-product]").forEach(btn => {
-        btn.onclick = () => togglePriority(btn.getAttribute("data-priority-product"), btn.getAttribute("data-priority-value"));
-      });
+      if (admin) {
+        document.querySelectorAll("[data-priority-product]").forEach(btn => {
+          btn.onclick = () => togglePriority(btn.getAttribute("data-priority-product"), btn.getAttribute("data-priority-value"));
+        });
+      }
     }
 
     function renderEvents() {
@@ -1682,6 +1794,30 @@ def html_page(initial_data):
     $("minPriceInput").oninput = renderProducts;
     $("maxPriceInput").oninput = renderProducts;
     $("refreshInterval").onchange = updateRefreshTimer;
+
+    $("loginBtn").onclick = async () => {
+      $("loginStatus").textContent = "正在登录...";
+      try {
+        await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ username: $("loginUser").value, password: $("loginPassword").value })
+        });
+        $("loginPassword").value = "";
+        $("loginStatus").textContent = "";
+        await load();
+      } catch (err) {
+        $("loginStatus").textContent = err.message;
+      }
+    };
+
+    $("loginPassword").onkeydown = (event) => {
+      if (event.key === "Enter") $("loginBtn").click();
+    };
+
+    $("logoutBtn").onclick = async () => {
+      await api("/api/logout", { method: "POST", body: JSON.stringify({}) });
+      await load();
+    };
 
     $("savePurchaseCheckBtn").onclick = async () => {
       $("purchaseCheckStatus").textContent = "正在保存...";
@@ -1784,11 +1920,25 @@ class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def send_json(self, payload, status=200):
+    def session(self):
+        return get_session(self.headers.get("Cookie", ""))
+
+    def is_admin(self):
+        return bool(self.session())
+
+    def require_admin(self):
+        if self.is_admin():
+            return True
+        self.send_json({"error": "需要管理员登录"}, 403)
+        return False
+
+    def send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1801,7 +1951,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
-            body = html_page(api_summary()).encode("utf-8")
+            body = html_page(api_summary(self.session())).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1809,7 +1959,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if parsed.path == "/api/summary":
-            self.send_json(api_summary())
+            self.send_json(api_summary(self.session()))
             return
         self.send_json({"error": "not found"}, 404)
 
@@ -1817,12 +1967,33 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             parsed = urllib.parse.urlparse(self.path)
             body = self.read_json()
+            if parsed.path == "/api/login":
+                if check_admin_credentials(body.get("username"), body.get("password")):
+                    token = create_session(ADMIN_USERNAME)
+                    self.send_json(
+                        {"ok": True, "auth": auth_payload({"username": ADMIN_USERNAME})},
+                        headers={"Set-Cookie": auth_cookie(token)},
+                    )
+                else:
+                    self.send_json({"error": "用户名或密码错误"}, 403)
+                return
+            if parsed.path == "/api/logout":
+                destroy_session(self.headers.get("Cookie", ""))
+                self.send_json(
+                    {"ok": True, "auth": auth_payload(None)},
+                    headers={"Set-Cookie": expired_auth_cookie()},
+                )
+                return
             if parsed.path == "/api/shops":
+                if not self.require_admin():
+                    return
                 token = add_shop(body.get("shop"), body.get("interval_seconds", DEFAULT_INTERVAL_SECONDS))
                 self.send_json({"ok": True, "token": token})
                 return
             match = re.fullmatch(r"/api/shops/(\d+)/delete", parsed.path)
             if match:
+                if not self.require_admin():
+                    return
                 with closing(db_connect()) as conn:
                     conn.execute("delete from shops where id = ?", (int(match.group(1)),))
                     conn.commit()
@@ -1830,6 +2001,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/shops/(\d+)/interval", parsed.path)
             if match:
+                if not self.require_admin():
+                    return
                 interval_seconds = max(int(body.get("interval_seconds") or DEFAULT_INTERVAL_SECONDS), 60)
                 with closing(db_connect()) as conn:
                     conn.execute(
@@ -1841,6 +2014,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/products/(\d+)/priority", parsed.path)
             if match:
+                if not self.require_admin():
+                    return
                 priority = 1 if body.get("priority") else 0
                 with closing(db_connect()) as conn:
                     conn.execute(
@@ -1851,18 +2026,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "priority": priority})
                 return
             if parsed.path == "/api/products/close-unpurchaseable":
+                if not self.require_admin():
+                    return
                 result = close_unpurchaseable_products()
                 self.send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/products/recheck-unpurchaseable":
+                if not self.require_admin():
+                    return
                 result = recheck_unpurchaseable_products(force=True)
                 self.send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/check":
+                if not self.require_admin():
+                    return
                 checked_any = check_enabled_shops(force=True, source="manual")
                 self.send_json({"ok": True, "checked_any": checked_any})
                 return
             if parsed.path == "/api/settings/purchase-check":
+                if not self.require_admin():
+                    return
                 with closing(db_connect()) as conn:
                     enabled = "1" if str(body.get("enabled", "0")) == "1" else "0"
                     set_setting(conn, "purchase_check_enabled", enabled)
@@ -1870,10 +2053,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "enabled": enabled})
                 return
             if parsed.path == "/api/settings/email":
+                if not self.require_admin():
+                    return
                 self.save_email_settings(body)
                 self.send_json({"ok": True})
                 return
             if parsed.path == "/api/settings/email/test":
+                if not self.require_admin():
+                    return
                 self.save_email_settings(body)
                 notify_email("库存监控测试邮件", f"这是一封测试邮件。\n发送时间：{now_text()}")
                 self.send_json({"ok": True})

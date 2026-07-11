@@ -7,6 +7,8 @@ services:
       HOST: 0.0.0.0
       PORT: ${PORT:-8765}
       DB_PATH: /app/data/ldxp_stock_webapp.sqlite3
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
     ports:
       - "${PORT:-8765}:${PORT:-8765}"
     volumes:

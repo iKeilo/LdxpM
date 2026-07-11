@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 STATE = {"empty": False, "broken_detail": False}
+APP_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
 
 
 def free_port():
@@ -115,7 +116,7 @@ def request_json(url, payload=None):
         method = "POST"
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with APP_OPENER.open(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -169,6 +170,17 @@ def main():
         try:
             base_url = f"http://127.0.0.1:{app_port}"
             wait_for_app(base_url, proc)
+            summary = request_json(f"{base_url}/api/summary")
+            assert_equal(summary["auth"]["is_admin"], False, "viewer should start unauthenticated")
+            assert "smtp_host" not in summary["settings"]
+            try:
+                request_json(f"{base_url}/api/check", {})
+                raise AssertionError("manual check should require admin login")
+            except urllib.error.HTTPError as exc:
+                assert_equal(exc.code, 403, "manual check without admin")
+            request_json(f"{base_url}/api/login", {"username": "admin", "password": "admin"})
+            summary = request_json(f"{base_url}/api/summary")
+            assert_equal(summary["auth"]["is_admin"], True, "admin should be logged in")
             request_json(f"{base_url}/api/check", {})
             summary = request_json(f"{base_url}/api/summary")
             assert_equal(len(summary["products"]), 1, "product should be imported")

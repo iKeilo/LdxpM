@@ -6,6 +6,8 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/ldxpm}"
 SERVICE_NAME="ldxpm"
 DEFAULT_PORT="8765"
 DEFAULT_IMAGE_TAG="latest"
+DEFAULT_ADMIN_USERNAME="admin"
+DEFAULT_ADMIN_PASSWORD="admin"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -57,9 +59,13 @@ install_deps() {
 
 write_env() {
   local port="$1"
+  local admin_username="$2"
+  local admin_password="$3"
   cat > "${INSTALL_DIR}/.env" <<EOF
 PORT=${port}
 IMAGE_TAG=${IMAGE_TAG:-${DEFAULT_IMAGE_TAG}}
+ADMIN_USERNAME=${admin_username}
+ADMIN_PASSWORD=${admin_password}
 EOF
 }
 
@@ -80,6 +86,11 @@ install_app() {
   install_deps
   read -rp "请输入 Web 端口 [${DEFAULT_PORT}]: " port
   port="${port:-$DEFAULT_PORT}"
+  read -rp "请输入管理员用户名 [${DEFAULT_ADMIN_USERNAME}]: " admin_username
+  admin_username="${admin_username:-$DEFAULT_ADMIN_USERNAME}"
+  read -rsp "请输入管理员密码 [${DEFAULT_ADMIN_PASSWORD}]: " admin_password
+  echo
+  admin_password="${admin_password:-$DEFAULT_ADMIN_PASSWORD}"
 
   if [ -d "${INSTALL_DIR}/.git" ]; then
     echo -e "${YELLOW}检测到已安装目录，正在更新代码...${NC}"
@@ -90,7 +101,7 @@ install_app() {
   fi
 
   mkdir -p "${INSTALL_DIR}/data"
-  write_env "${port}"
+  write_env "${port}" "${admin_username}" "${admin_password}"
   cd "${INSTALL_DIR}"
   $(compose_cmd) pull
   $(compose_cmd) up -d
