@@ -13,7 +13,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-STATE = {"empty": False, "broken_detail": False, "gzip": True}
+CHALLENGE_ARG1 = "3E091BA15043A258FD3613E5C7EB5727D2A33943"
+CHALLENGE_COOKIE = "acw_sc__v2=6a55cf5905b75e38cca14c3211748ea9d68b2046"
+STATE = {"empty": False, "broken_detail": False, "gzip": True, "challenge": True}
 APP_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
 
 
@@ -39,11 +41,31 @@ class FakeShopHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_challenge(self):
+        body = (
+            f"<html><script>var arg1='{CHALLENGE_ARG1}';"
+            "document.cookie='acw_sc__v2=calculated';location.reload();"
+            "</script></html>"
+        ).encode("utf-8")
+        if STATE["gzip"]:
+            body = gzip.compress(body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        if STATE["gzip"]:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         token = payload.get("token") or "TESTSHOP"
         base_url = f"http://127.0.0.1:{FAKE_PORT}"
+
+        if STATE["challenge"] and CHALLENGE_COOKIE not in (self.headers.get("Cookie") or ""):
+            self.send_challenge()
+            return
 
         if self.path == "/shopApi/Shop/info":
             count = 0 if STATE["empty"] else 1

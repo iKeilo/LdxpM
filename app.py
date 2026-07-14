@@ -33,6 +33,13 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 SESSION_COOKIE = "ldxpm_admin_session"
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+ACW_SC_V2_PERMUTATION = (
+    15, 35, 29, 24, 33, 16, 1, 38, 10, 9,
+    19, 31, 40, 27, 22, 23, 25, 13, 6, 11,
+    39, 18, 20, 8, 14, 21, 32, 26, 2, 30,
+    7, 4, 17, 5, 3, 28, 34, 37, 12, 36,
+)
+ACW_SC_V2_XOR_KEY = "3000176000856006061501533003690027800375"
 MONITOR_STATUS = {
     "started_at": None,
     "last_heartbeat_at": None,
@@ -46,6 +53,8 @@ MONITOR_STATUS_LOCK = threading.Lock()
 CHECK_LOCK = threading.Lock()
 SESSION_LOCK = threading.Lock()
 SESSIONS = {}
+UPSTREAM_COOKIE_LOCK = threading.Lock()
+UPSTREAM_COOKIE = ""
 
 
 def now_text():
@@ -150,23 +159,70 @@ def decode_response_body(response):
     return raw.decode("utf-8")
 
 
+def solve_acw_sc_v2_challenge(text):
+    match = re.search(r"\bvar\s+arg1\s*=\s*['\"]([0-9a-fA-F]{40})['\"]", text or "")
+    if not match:
+        return None
+    arg1 = match.group(1)
+    reordered = "".join(arg1[position - 1] for position in ACW_SC_V2_PERMUTATION)
+    value = "".join(
+        f"{int(reordered[index:index + 2], 16) ^ int(ACW_SC_V2_XOR_KEY[index:index + 2], 16):02x}"
+        for index in range(0, len(ACW_SC_V2_XOR_KEY), 2)
+    )
+    return f"acw_sc__v2={value}"
+
+
+def get_upstream_cookie():
+    with UPSTREAM_COOKIE_LOCK:
+        return UPSTREAM_COOKIE
+
+
+def set_upstream_cookie(value):
+    global UPSTREAM_COOKIE
+    with UPSTREAM_COOKIE_LOCK:
+        UPSTREAM_COOKIE = value
+
+
 def request_json(path, payload, timeout=25):
     token = payload.get("token", "")
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        BASE_URL + path,
-        data=body,
-        method="POST",
-        headers={
+    for attempt in range(2):
+        headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, deflate, identity",
             "Content-Type": "application/json",
             "Referer": f"{BASE_URL}/shop/{token}/",
             "User-Agent": "Mozilla/5.0 ldxp-stock-webapp/1.0",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(decode_response_body(response))
+        }
+        cookie = get_upstream_cookie()
+        if cookie:
+            headers["Cookie"] = cookie
+        request = urllib.request.Request(
+            BASE_URL + path,
+            data=body,
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            response_text = decode_response_body(response)
+        try:
+            result = json.loads(response_text)
+            break
+        except json.JSONDecodeError as exc:
+            challenge_cookie = solve_acw_sc_v2_challenge(response_text)
+            if challenge_cookie and attempt == 0:
+                set_upstream_cookie(challenge_cookie)
+                continue
+            if not response_text.strip():
+                reason = "上游返回空响应"
+            elif challenge_cookie:
+                reason = "上游风控验证未通过"
+            elif "text/html" in content_type or response_text.lstrip().startswith("<"):
+                reason = "上游返回 HTML 页面，可能触发了风控验证"
+            else:
+                reason = "上游返回无效 JSON"
+            raise RuntimeError(f"{path} {reason}") from exc
     if result.get("code") != 1:
         raise RuntimeError(result.get("msg") or f"{path} failed")
     return result.get("data")
