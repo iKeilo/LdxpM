@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import gzip
 import json
 import hmac
 import os
@@ -10,6 +11,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from contextlib import closing
 from datetime import datetime
 from email.message import EmailMessage
@@ -138,6 +140,16 @@ def extract_token(value):
     return value.strip("/")
 
 
+def decode_response_body(response):
+    raw = response.read()
+    encoding = (response.headers.get("Content-Encoding") or "").lower()
+    if "gzip" in encoding or raw.startswith(b"\x1f\x8b"):
+        raw = gzip.decompress(raw)
+    elif "deflate" in encoding:
+        raw = zlib.decompress(raw)
+    return raw.decode("utf-8")
+
+
 def request_json(path, payload, timeout=25):
     token = payload.get("token", "")
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -147,13 +159,14 @@ def request_json(path, payload, timeout=25):
         method="POST",
         headers={
             "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, identity",
             "Content-Type": "application/json",
             "Referer": f"{BASE_URL}/shop/{token}/",
             "User-Agent": "Mozilla/5.0 ldxp-stock-webapp/1.0",
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
+        result = json.loads(decode_response_body(response))
     if result.get("code") != 1:
         raise RuntimeError(result.get("msg") or f"{path} failed")
     return result.get("data")

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import gzip
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-STATE = {"empty": False, "broken_detail": False}
+STATE = {"empty": False, "broken_detail": False, "gzip": True}
 APP_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
 
 
@@ -28,8 +29,12 @@ class FakeShopHandler(BaseHTTPRequestHandler):
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if STATE["gzip"]:
+            body = gzip.compress(body)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if STATE["gzip"]:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
