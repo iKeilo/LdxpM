@@ -15,7 +15,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CHALLENGE_ARG1 = "3E091BA15043A258FD3613E5C7EB5727D2A33943"
 CHALLENGE_COOKIE = "acw_sc__v2=6a55cf5905b75e38cca14c3211748ea9d68b2046"
-STATE = {"empty": False, "broken_detail": False, "gzip": True, "challenge": True}
+STATE = {
+    "empty": False,
+    "broken_detail": False,
+    "gzip": True,
+    "challenge": True,
+    "human_verification": False,
+    "request_count": 0,
+}
 APP_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
 
 
@@ -57,11 +64,31 @@ class FakeShopHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_human_verification(self):
+        body = (
+            "<!doctype html><script>window._waf_is_mobile=false;</script>"
+            "<div id='captcha'>Human verification required</div>"
+        ).encode("utf-8")
+        if STATE["gzip"]:
+            body = gzip.compress(body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        if STATE["gzip"]:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
+        STATE["request_count"] += 1
         length = int(self.headers.get("Content-Length", "0") or "0")
         payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         token = payload.get("token") or "TESTSHOP"
         base_url = f"http://127.0.0.1:{FAKE_PORT}"
+
+        if STATE["human_verification"]:
+            self.send_human_verification()
+            return
 
         if STATE["challenge"] and CHALLENGE_COOKIE not in (self.headers.get("Cookie") or ""):
             self.send_challenge()
@@ -184,6 +211,8 @@ def main():
                 "DB_PATH": db_path,
                 "HOST": "127.0.0.1",
                 "PORT": str(app_port),
+                "UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS": "0",
+                "UPSTREAM_HUMAN_CHECK_COOLDOWN_SECONDS": "60",
             }
         )
         proc = subprocess.Popen(
@@ -244,6 +273,21 @@ def main():
             assert summary["shops"][0]["last_error"] == "店铺当前没有上架商品"
             assert summary["events"][0]["event_type"] == "unlisted"
             assert "已不在店铺上架列表中" in summary["events"][0]["message"]
+
+            STATE["human_verification"] = True
+            requests_before = STATE["request_count"]
+            request_json(f"{base_url}/api/check", {})
+            requests_after_first_check = STATE["request_count"]
+            assert requests_after_first_check > requests_before
+            summary = request_json(f"{base_url}/api/summary")
+            assert "已暂停" in summary["shops"][0]["last_error"]
+            assert summary["monitor"]["upstream_blocked_until"]
+            request_json(f"{base_url}/api/check", {})
+            assert_equal(
+                STATE["request_count"],
+                requests_after_first_check,
+                "circuit breaker should prevent repeated upstream requests",
+            )
             print("blackbox_empty_shop: ok")
         finally:
             proc.terminate()

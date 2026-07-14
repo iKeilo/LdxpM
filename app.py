@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +33,19 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 SESSION_COOKIE = "ldxpm_admin_session"
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS = max(
+    float(os.environ.get("UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS", "5")),
+    0.0,
+)
+UPSTREAM_HUMAN_CHECK_COOLDOWN_SECONDS = max(
+    int(os.environ.get("UPSTREAM_HUMAN_CHECK_COOLDOWN_SECONDS", "1800")),
+    60,
+)
+UPSTREAM_HUMAN_CHECK_MAX_COOLDOWN_SECONDS = 6 * 60 * 60
+PURCHASE_VALIDATION_INTERVAL_SECONDS = max(
+    int(os.environ.get("PURCHASE_VALIDATION_INTERVAL_SECONDS", "21600")),
+    600,
+)
 ACW_SC_V2_PERMUTATION = (
     15, 35, 29, 24, 33, 16, 1, 38, 10, 9,
     19, 31, 40, 27, 22, 23, 25, 13, 6, 11,
@@ -46,6 +59,8 @@ MONITOR_STATUS = {
     "last_background_check_at": None,
     "last_manual_check_at": None,
     "last_error": None,
+    "upstream_blocked_until": None,
+    "upstream_human_checks": 0,
     "checks_started": 0,
     "checks_finished": 0,
 }
@@ -55,6 +70,12 @@ SESSION_LOCK = threading.Lock()
 SESSIONS = {}
 UPSTREAM_COOKIE_LOCK = threading.Lock()
 UPSTREAM_COOKIE = ""
+UPSTREAM_REQUEST_LOCK = threading.Lock()
+UPSTREAM_STATE_LOCK = threading.Lock()
+UPSTREAM_LAST_REQUEST_AT = 0.0
+UPSTREAM_BLOCKED_UNTIL = 0.0
+UPSTREAM_CONSECUTIVE_HUMAN_CHECKS = 0
+UPSTREAM_HUMAN_CHECKS_TOTAL = 0
 
 
 def now_text():
@@ -66,6 +87,10 @@ def safe_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+class UpstreamHumanVerificationError(RuntimeError):
+    pass
 
 
 def update_monitor_status(**kwargs):
@@ -183,6 +208,80 @@ def set_upstream_cookie(value):
         UPSTREAM_COOKIE = value
 
 
+def upstream_block_error():
+    with UPSTREAM_STATE_LOCK:
+        blocked_until = UPSTREAM_BLOCKED_UNTIL
+    if blocked_until <= time.time():
+        return None
+    remaining_seconds = max(1, int(blocked_until - time.time()))
+    remaining_minutes = max(1, (remaining_seconds + 59) // 60)
+    return UpstreamHumanVerificationError(
+        f"目标网站要求人机验证，已暂停上游请求，约 {remaining_minutes} 分钟后自动重试"
+    )
+
+
+def ensure_upstream_available():
+    error = upstream_block_error()
+    if error:
+        raise error
+
+
+def trip_upstream_human_verification():
+    global UPSTREAM_BLOCKED_UNTIL
+    global UPSTREAM_CONSECUTIVE_HUMAN_CHECKS
+    global UPSTREAM_HUMAN_CHECKS_TOTAL
+
+    with UPSTREAM_STATE_LOCK:
+        UPSTREAM_CONSECUTIVE_HUMAN_CHECKS += 1
+        UPSTREAM_HUMAN_CHECKS_TOTAL += 1
+        multiplier = 2 ** min(UPSTREAM_CONSECUTIVE_HUMAN_CHECKS - 1, 4)
+        cooldown = min(
+            UPSTREAM_HUMAN_CHECK_COOLDOWN_SECONDS * multiplier,
+            UPSTREAM_HUMAN_CHECK_MAX_COOLDOWN_SECONDS,
+        )
+        UPSTREAM_BLOCKED_UNTIL = time.time() + cooldown
+        blocked_until_text = datetime.fromtimestamp(UPSTREAM_BLOCKED_UNTIL).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        total = UPSTREAM_HUMAN_CHECKS_TOTAL
+    update_monitor_status(
+        upstream_blocked_until=blocked_until_text,
+        upstream_human_checks=total,
+    )
+    return UpstreamHumanVerificationError(
+        f"目标网站要求人机验证，已暂停上游请求至 {blocked_until_text}"
+    )
+
+
+def clear_upstream_human_verification():
+    global UPSTREAM_BLOCKED_UNTIL
+    global UPSTREAM_CONSECUTIVE_HUMAN_CHECKS
+
+    with UPSTREAM_STATE_LOCK:
+        was_blocked = bool(UPSTREAM_BLOCKED_UNTIL or UPSTREAM_CONSECUTIVE_HUMAN_CHECKS)
+        UPSTREAM_BLOCKED_UNTIL = 0.0
+        UPSTREAM_CONSECUTIVE_HUMAN_CHECKS = 0
+    if was_blocked:
+        update_monitor_status(upstream_blocked_until=None)
+
+
+def read_upstream_response(request, timeout):
+    global UPSTREAM_LAST_REQUEST_AT
+
+    with UPSTREAM_REQUEST_LOCK:
+        ensure_upstream_available()
+        wait_seconds = UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS - (
+            time.monotonic() - UPSTREAM_LAST_REQUEST_AT
+        )
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        UPSTREAM_LAST_REQUEST_AT = time.monotonic()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            response_text = decode_response_body(response)
+    return content_type, response_text
+
+
 def request_json(path, payload, timeout=25):
     token = payload.get("token", "")
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -203,11 +302,10 @@ def request_json(path, payload, timeout=25):
             method="POST",
             headers=headers,
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            response_text = decode_response_body(response)
+        content_type, response_text = read_upstream_response(request, timeout)
         try:
             result = json.loads(response_text)
+            clear_upstream_human_verification()
             break
         except json.JSONDecodeError as exc:
             challenge_cookie = solve_acw_sc_v2_challenge(response_text)
@@ -216,10 +314,8 @@ def request_json(path, payload, timeout=25):
                 continue
             if not response_text.strip():
                 reason = "上游返回空响应"
-            elif challenge_cookie:
-                reason = "上游风控验证未通过"
             elif "text/html" in content_type or response_text.lstrip().startswith("<"):
-                reason = "上游返回 HTML 页面，可能触发了风控验证"
+                raise trip_upstream_human_verification() from exc
             else:
                 reason = "上游返回无效 JSON"
             raise RuntimeError(f"{path} {reason}") from exc
@@ -269,6 +365,7 @@ def init_db():
                 missing_since text,
                 inactive_reason text,
                 last_recheck_at text,
+                last_purchase_check_at text,
                 last_seen_at text not null,
                 created_at text not null,
                 unique(shop_id, goods_key),
@@ -316,6 +413,7 @@ def init_db():
         ensure_column(conn, "products", "missing_since", "text")
         ensure_column(conn, "products", "inactive_reason", "text")
         ensure_column(conn, "products", "last_recheck_at", "text")
+        ensure_column(conn, "products", "last_purchase_check_at", "text")
         ensure_column(conn, "events", "email_subject", "text")
         conn.execute(
             "update products set last_stock_alert_stock = stock where last_stock_alert_stock is null"
@@ -965,7 +1063,6 @@ def deactivate_product(conn, product_id, checked_at, reason, inactive_reason="un
 
 
 def close_unpurchaseable_products():
-    checked_at = now_text()
     closed = 0
     checked = 0
     errors = []
@@ -982,19 +1079,80 @@ def close_unpurchaseable_products():
 
     for row in rows:
         checked += 1
+        checked_at = now_text()
         try:
             ok, reason = product_is_purchaseable(row["goods_key"], row["token"])
+        except UpstreamHumanVerificationError as exc:
+            errors.append(f"{row['goods_key']}: {exc}")
+            break
         except Exception as exc:
             errors.append(f"{row['goods_key']}: {exc}")
-            continue
-        if ok:
+            with closing(db_connect()) as conn:
+                conn.execute(
+                    "update products set last_purchase_check_at = ? where id = ?",
+                    (checked_at, row["id"]),
+                )
+                conn.commit()
             continue
         with closing(db_connect()) as conn:
-            if deactivate_product(conn, row["id"], checked_at, reason, notify=False):
+            conn.execute(
+                "update products set last_purchase_check_at = ? where id = ?",
+                (checked_at, row["id"]),
+            )
+            if not ok and deactivate_product(conn, row["id"], checked_at, reason, notify=False):
                 closed += 1
             conn.commit()
 
     return {"checked": checked, "closed": closed, "errors": errors[:20]}
+
+
+def validate_next_active_purchase_link():
+    if not purchase_check_enabled():
+        return {"checked": 0, "closed": 0, "errors": []}
+
+    cutoff = (datetime.now() - timedelta(seconds=PURCHASE_VALIDATION_INTERVAL_SECONDS)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            """
+            select p.id, p.goods_key, s.token
+            from products p
+            join shops s on s.id = p.shop_id
+            where p.is_active = 1 and s.enabled = 1
+              and (p.last_purchase_check_at is null or p.last_purchase_check_at <= ?)
+            order by p.last_purchase_check_at is not null, p.last_purchase_check_at, p.id
+            limit 1
+            """,
+            (cutoff,),
+        ).fetchone()
+    if not row:
+        return {"checked": 0, "closed": 0, "errors": []}
+
+    checked_at = now_text()
+    try:
+        ok, reason = product_is_purchaseable(row["goods_key"], row["token"])
+    except UpstreamHumanVerificationError as exc:
+        return {"checked": 1, "closed": 0, "errors": [f"{row['goods_key']}: {exc}"]}
+    except Exception as exc:
+        with closing(db_connect()) as conn:
+            conn.execute(
+                "update products set last_purchase_check_at = ? where id = ?",
+                (checked_at, row["id"]),
+            )
+            conn.commit()
+        return {"checked": 1, "closed": 0, "errors": [f"{row['goods_key']}: {exc}"]}
+
+    closed = 0
+    with closing(db_connect()) as conn:
+        conn.execute(
+            "update products set last_purchase_check_at = ? where id = ?",
+            (checked_at, row["id"]),
+        )
+        if not ok and deactivate_product(conn, row["id"], checked_at, reason, notify=False):
+            closed = 1
+        conn.commit()
+    return {"checked": 1, "closed": closed, "errors": []}
 
 
 def reactivate_product(conn, row, info, checked_at):
@@ -1013,7 +1171,7 @@ def reactivate_product(conn, row, info, checked_at):
             price_delta = ?, previous_stock = stock, stock = ?,
             last_stock_alert_stock = ?, link = ?, is_active = 1,
             missing_since = null, inactive_reason = null,
-            last_recheck_at = ?, last_seen_at = ?
+            last_recheck_at = ?, last_purchase_check_at = ?, last_seen_at = ?
         where id = ?
         """,
         (
@@ -1025,6 +1183,7 @@ def reactivate_product(conn, row, info, checked_at):
             current_stock,
             current_stock,
             link,
+            checked_at,
             checked_at,
             checked_at,
             row["id"],
@@ -1041,36 +1200,46 @@ def reactivate_product(conn, row, info, checked_at):
     record_purchaseable_event(conn, row["shop_id"], row["id"], product)
 
 
-def recheck_unpurchaseable_products(force=False):
-    now = datetime.now()
-    checked_at = now_text()
+def recheck_unpurchaseable_products(force=False, limit=None):
     checked = 0
     restored = 0
     errors = []
+    params = []
+    due_clause = ""
+    if not force:
+        cutoff = (datetime.now() - timedelta(seconds=UNPURCHASEABLE_RECHECK_SECONDS)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        due_clause = "and (p.last_recheck_at is null or p.last_recheck_at <= ?)"
+        params.append(cutoff)
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = "limit ?"
+        params.append(max(1, int(limit)))
     with closing(db_connect()) as conn:
         rows = conn.execute(
-            """
+            f"""
             select p.*, s.token
             from products p
             join shops s on s.id = p.shop_id
             where p.is_active = 0 and p.inactive_reason = 'unpurchaseable'
+              {due_clause}
             order by p.last_recheck_at is not null, p.last_recheck_at, p.id
-            """
+            {limit_clause}
+            """,
+            params,
         ).fetchall()
 
     for row in rows:
-        if not force and row["last_recheck_at"]:
-            try:
-                last = datetime.strptime(row["last_recheck_at"], "%Y-%m-%d %H:%M:%S")
-                if (now - last).total_seconds() < UNPURCHASEABLE_RECHECK_SECONDS:
-                    continue
-            except ValueError:
-                pass
         checked += 1
+        checked_at = now_text()
         try:
             info = fetch_goods_info(row["goods_key"], row["token"])
             if safe_int(info.get("status"), 1) != 1:
                 raise RuntimeError("商品状态不是上架")
+        except UpstreamHumanVerificationError as exc:
+            errors.append(f"{row['goods_key']}: {exc}")
+            break
         except Exception as exc:
             with closing(db_connect()) as conn:
                 conn.execute("update products set last_recheck_at = ? where id = ?", (checked_at, row["id"]))
@@ -1099,7 +1268,6 @@ def check_shop(shop_row):
     shop_name = shop_info.get("nickname") or shop_row["name"]
     shop_link = shop_info.get("link") or shop_row["link"] or shop_list_url(token)
     remote_reports_products = shop_has_listed_goods(shop_info)
-    verify_purchase = purchase_check_enabled()
 
     with closing(db_connect()) as conn:
         conn.execute(
@@ -1121,13 +1289,6 @@ def check_shop(shop_row):
                 and safe_int(existing["is_active"], 1) == 0
                 and existing["inactive_reason"] == "unpurchaseable"
             )
-            purchaseable = True
-            purchase_reason = None
-            if verify_purchase and not suppressed_unpurchaseable:
-                try:
-                    purchaseable, purchase_reason = product_is_purchaseable(product["goods_key"], token)
-                except Exception as exc:
-                    purchase_reason = str(exc)
             previous_stock = safe_int(existing["stock"]) if existing else 0
             previous_price = float(existing["price"] or 0) if existing else float(product["price"] or 0)
             current_price = float(product["price"] or 0)
@@ -1209,11 +1370,6 @@ def check_shop(shop_row):
                 product_id = cursor.lastrowid
 
             conn.commit()
-            if not purchaseable:
-                with closing(db_connect()) as deactivate_conn:
-                    deactivate_product(deactivate_conn, product_id, checked_at, purchase_reason, notify=False)
-                    deactivate_conn.commit()
-                continue
             if existing and previous_stock <= 0 < current_stock:
                 record_restock_event(conn, shop_id, product_id, product, previous_stock, current_stock)
             if existing and previous_stock > 0 and current_stock == 0:
@@ -1246,7 +1402,20 @@ def check_enabled_shops(force=False, source="background"):
         return False
     try:
         update_monitor_status(checks_started=get_monitor_status()["checks_started"] + 1)
+        blocked_error = upstream_block_error()
+        if blocked_error:
+            flush_stock_drop_alerts(force=False)
+            flush_email_digest(force=False)
+            update_monitor_status(
+                checks_finished=get_monitor_status()["checks_finished"] + 1,
+                last_heartbeat_at=now_text(),
+                last_error=str(blocked_error),
+            )
+            return False
+
         checked_any = False
+        maintenance_checked = False
+        cycle_error = None
         with closing(db_connect()) as conn:
             shops = conn.execute("select * from shops where enabled = 1").fetchall()
         for shop in shops:
@@ -1261,6 +1430,7 @@ def check_enabled_shops(force=False, source="background"):
                     check_shop(shop)
                     checked_any = True
             except Exception as exc:
+                cycle_error = str(exc)
                 update_monitor_status(last_error=str(exc))
                 with closing(db_connect()) as conn:
                     conn.execute(
@@ -1269,10 +1439,22 @@ def check_enabled_shops(force=False, source="background"):
                     )
                     conn.commit()
         flush_stock_drop_alerts(force=False)
-        recheck_unpurchaseable_products(force=False)
+        recheck_result = recheck_unpurchaseable_products(force=False, limit=1)
+        maintenance_checked = recheck_result["checked"] > 0
+        if recheck_result["errors"]:
+            cycle_error = recheck_result["errors"][0]
+        elif not maintenance_checked:
+            validation_result = validate_next_active_purchase_link()
+            maintenance_checked = validation_result["checked"] > 0
+            if validation_result["errors"]:
+                cycle_error = validation_result["errors"][0]
         flush_email_digest(force=False)
         finished = get_monitor_status()["checks_finished"] + 1
         payload = {"checks_finished": finished, "last_heartbeat_at": now_text()}
+        if cycle_error:
+            payload["last_error"] = cycle_error
+        elif checked_any or maintenance_checked:
+            payload["last_error"] = None
         if checked_any:
             if source == "manual":
                 payload["last_manual_check_at"] = now_text()
@@ -1369,6 +1551,8 @@ def api_summary(session=None):
         settings = {
             "purchase_check_enabled": setting(conn, "purchase_check_enabled", "0"),
             "unpurchaseable_recheck_seconds": str(UNPURCHASEABLE_RECHECK_SECONDS),
+            "purchase_validation_seconds": str(PURCHASE_VALIDATION_INTERVAL_SECONDS),
+            "upstream_min_request_interval_seconds": str(UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS),
         }
         if is_admin:
             settings.update(
@@ -1678,7 +1862,10 @@ def html_page(initial_data):
       $("inStockCount").textContent = activeProducts.filter(p => p.stock > 0).length;
       $("priceChangeCount").textContent = activeProducts.filter(p => Number(p.price_delta || 0) !== 0).length;
       $("inactiveCount").textContent = inactiveProducts.length;
-      $("monitorHeartbeat").textContent = data.monitor?.last_heartbeat_at || "未启动";
+      const upstreamBlockedUntil = data.monitor?.upstream_blocked_until;
+      $("monitorHeartbeat").textContent = upstreamBlockedUntil ? "风控暂停" : (data.monitor?.last_heartbeat_at || "未启动");
+      $("monitorHeartbeat").classList.toggle("error", Boolean(upstreamBlockedUntil));
+      $("monitorHeartbeat").title = upstreamBlockedUntil ? `暂停至 ${upstreamBlockedUntil}` : "";
       $("loginPanel").style.display = admin ? "none" : "";
       $("adminSessionPanel").style.display = admin ? "" : "none";
       $("adminName").textContent = admin ? `已登录：${data.auth.username}` : "未登录";
@@ -1696,7 +1883,7 @@ def html_page(initial_data):
       $("smtpSecurity").value = settings.smtp_security || (settings.smtp_tls === "0" ? "none" : "starttls");
       $("emailEnabled").checked = settings.email_enabled === "1";
       $("purchaseCheckEnabled").checked = settings.purchase_check_enabled === "1";
-      $("purchaseCheckHint").textContent = `被一键关闭的不可购买连接会在后台约每 ${Math.round(Number(settings.unpurchaseable_recheck_seconds || 600) / 60)} 分钟复查一次；恢复可购买后会重新回到前台并发送恢复邮件。关闭期间不参与邮件提醒。`;
+      $("purchaseCheckHint").textContent = `自动验证会低频分散执行；已关闭连接约每 ${Math.round(Number(settings.unpurchaseable_recheck_seconds || 600) / 60)} 分钟复查一次。触发目标站人机验证时会自动暂停请求。`;
 
       $("shopFilter").innerHTML = `<option value="all">全部店铺</option>` + data.shops.map(shop =>
         `<option value="${shop.id}">${escapeHtml(shop.name)}</option>`

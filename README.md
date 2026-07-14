@@ -187,13 +187,18 @@ HOST=0.0.0.0 PORT=8765 DB_PATH=./ldxp_stock_webapp.sqlite3 ./ldxpm
 | `DEFAULT_SHOP_URL` | `https://pay.ldxp.cn/shop/WPXSCE1B/` | 首次启动自动添加的默认店铺 |
 | `ADMIN_USERNAME` | `admin` | 管理员用户名 |
 | `ADMIN_PASSWORD` | `admin` | 管理员密码，建议部署时修改 |
+| `UPSTREAM_MIN_REQUEST_INTERVAL_SECONDS` | `5` | 所有目标站请求之间的最小间隔，降低触发风控的概率 |
+| `UPSTREAM_HUMAN_CHECK_COOLDOWN_SECONDS` | `1800` | 遇到完整人机验证后的首次暂停时长，重复触发会自动延长 |
+| `PURCHASE_VALIDATION_INTERVAL_SECONDS` | `21600` | 上架商品链接的低频自动可购买性验证周期 |
 
 ## 测试
 
-项目包含一个黑盒回归测试，会启动假购物站和本服务，模拟“店铺从有商品变成商品未上架”的场景：
+项目包含黑盒、邮件摘要和上游请求安全回归测试：
 
 ```bash
 python tests/blackbox_empty_shop.py
+python tests/email_digest_test.py
+python tests/upstream_safety_test.py
 ```
 
 ## 安全提醒
